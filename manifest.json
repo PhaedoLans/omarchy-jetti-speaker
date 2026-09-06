@@ -6,8 +6,21 @@
   "author": "jetti",
   "license": "MIT",
   "description": "Play through every speaker at once -- Bluetooth, laptop, and screen -- then measure the room with a microphone and let an agent time-align and stereo-place them.",
-  "keywords": ["audio", "speakers", "pipewire", "multiroom", "calibration", "stereo"],
-  "kinds": ["overlay", "bar-widget", "service"],
+  "homepage": "https://github.com/PhaedoLans/omarchy-jetti-speaker",
+  "repository": "https://github.com/PhaedoLans/omarchy-jetti-speaker",
+  "keywords": [
+    "audio",
+    "speakers",
+    "pipewire",
+    "multiroom",
+    "calibration",
+    "stereo"
+  ],
+  "kinds": [
+    "overlay",
+    "bar-widget",
+    "service"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "overlay": "JettiSpeaker.qml",
