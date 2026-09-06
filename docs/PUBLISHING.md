@@ -7,8 +7,7 @@ Nothing here is published yet. This is what to use and what to check first.
 The one-liner that appears under the repo name, in search results, and on your
 profile:
 
-> Use all detectable speakers you connect to your computer at once, and
-> harmonize them with AI.
+> Turn all detectable speakers on your PC into usable stereo harmony.
 
 ## Suggested repo name
 
