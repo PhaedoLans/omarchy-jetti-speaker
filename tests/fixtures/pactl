@@ -1,0 +1,12 @@
+#!/bin/bash
+# Test stub: replays a captured topology so device detection can be tested
+# without hardware. Only the invocations jspeaker-devices actually makes are served;
+# anything else fails loudly rather than returning a plausible-looking lie.
+DATA="$(dirname "$(readlink -f "$0")")/data"
+case "$*" in
+"-f json list cards")   cat "$DATA/cards.json" ;;
+"-f json list sinks")   cat "$DATA/sinks.json" ;;
+"-f json list sources") cat "$DATA/sources.json" ;;
+"get-default-sink")     cat "$DATA/default-sink.txt" ;;
+*) echo "pactl stub: unexpected invocation: $*" >&2; exit 64 ;;
+esac

@@ -1,0 +1,44 @@
+#!/bin/bash
+# Jetti Speaker -- one command in front of the pieces.
+#
+#   jspeaker devices              what speakers exist, including ones a card is hiding
+#   jspeaker profile <cmd>        read/edit the tuning profile
+#   jspeaker card <cmd>           unlock hidden outputs, and put them back
+#   jspeaker calibrate            measure the group with a microphone
+#   jspeaker levels               stream live per-speaker output levels as JSON
+#   jspeaker tune [description]   turn measurements into a tuning
+#   jspeaker apply | stop         build or tear down the fan-out
+#   jspeaker status               what the graph is doing right now
+
+set -uo pipefail
+BIN="$(dirname "$(readlink -f "$0")")"
+
+usage() {
+  # Print the header comment, however long it is -- a hardcoded line range
+  # silently drops a command the moment one is added.
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+
+Getting started:
+  jspeaker profile init                 build a profile from what is plugged in
+  jspeaker calibrate                    play sweeps, listen, measure the group
+  jspeaker tune "where things are"      let the agent decide the tuning
+  jspeaker apply                        route everything through the group
+USAGE
+}
+
+case "${1:-status}" in
+devices)   shift; exec "$BIN/jspeaker-devices" "$@" ;;
+profile)   shift; exec "$BIN/jspeaker-profile" "$@" ;;
+card)      shift; exec "$BIN/jspeaker-card" "$@" ;;
+calibrate) shift; exec "$BIN/jspeaker-calibrate" "$@" ;;
+levels)    shift; exec "$BIN/jspeaker-levels" "$@" ;;
+tune)      shift; exec "$BIN/jspeaker-tune" "$@" ;;
+graph)     shift; exec "$BIN/jspeaker-graph" "$@" ;;
+apply)     shift; exec "$BIN/jspeaker-graph" apply "$@" ;;
+stop)      shift; exec "$BIN/jspeaker-graph" stop "$@" ;;
+restart)   shift; exec "$BIN/jspeaker-graph" restart "$@" ;;
+status)    shift; exec "$BIN/jspeaker-graph" status "$@" ;;
+-h | --help | help) usage ;;
+*) echo "jspeaker: unknown command: $1" >&2; usage; exit 1 ;;
+esac

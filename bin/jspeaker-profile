@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Read and edit the Jetti Speaker tuning profile.
+
+The profile is the single source of truth for what the graph should look like:
+which speakers are in the group, what each one plays, and how it is tuned.
+`jspeaker-graph apply` never decides anything on its own -- it renders this file.
+
+Editing goes through this command rather than through the UI writing JSON
+directly, so a malformed value is rejected in one place and the file on disk is
+always something the graph can actually build.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "omarchy", "jetti-speaker",
+)
+PROFILE = os.path.join(CONFIG, "profile.json")
+
+ROLES = ("stereo", "left", "right", "mono")
+
+# What part of the spectrum a speaker is responsible for. This is separate from
+# the channel role above: a speaker has both a position in the stereo image and
+# a job in the frequency range.
+#
+#   primary  full range, and the reference everything else is aligned to --
+#            the speaker that can actually carry bass.
+#   tweeter  high-passed. For a small driver that has no low end anyway:
+#            removing bass it cannot reproduce frees excursion, so it plays
+#            the highs it IS good at louder and cleaner.
+#   bass     low-passed. The opposite job, for a speaker with reach but no
+#            detail.
+BANDS = ("primary", "tweeter", "bass")
+GAIN_MAX = 4.0          # +12 dB; beyond this a small driver just distorts
+CROSSOVER_MIN, CROSSOVER_MAX = 80.0, 8000.0
+CROSSOVER_DEFAULT = 800.0
+
+
+def die(msg):
+    print("jspeaker-profile: %s" % msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def detect():
+    out = subprocess.run(
+        [os.path.join(HERE, "jspeaker-devices")], capture_output=True, text=True
+    )
+    if out.returncode != 0:
+        die("device detection failed: %s" % out.stderr.strip())
+    return json.loads(out.stdout)
+
+
+def load():
+    if not os.path.exists(PROFILE):
+        return None
+    try:
+        with open(PROFILE) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        die("cannot read profile: %s" % exc)
+
+
+def save(profile):
+    os.makedirs(CONFIG, exist_ok=True)
+    profile["updatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    fd, tmp = tempfile.mkstemp(dir=CONFIG, prefix=".profile.")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(profile, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, PROFILE)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def default_role(index, total, kind):
+    """A sane first guess before anything is calibrated.
+
+    One speaker gets everything. Two get a real left/right pair. Beyond that,
+    guessing a stereo layout from device names alone is worse than honest
+    full-range on each -- calibration is what earns the right to split them.
+    """
+    if total == 1:
+        return "stereo"
+    if total == 2:
+        return "left" if index == 0 else "right"
+    return "stereo"
+
+
+def blank_speaker(dev, index, total, enabled=None):
+    """A speaker entry with no tuning yet.
+
+    `enabled` is decided by the caller because the right default differs:
+    building a profile from scratch should give you a working group, but a
+    rescan must never change what is playing. A sink that appears while the
+    group is live -- another application's virtual device, a screen-sharing
+    tool, anything -- should wait to be invited.
+    """
+    if enabled is None:
+        enabled = dev["state"] == "live" and dev["kind"] != "usb-headset"
+    return {
+        "key": dev["key"],
+        "sink": dev["sink"],
+        "label": dev["label"],
+        "kind": dev["kind"],
+        "enabled": enabled,
+        "channel": default_role(index, total, dev["kind"]),
+        "gain": 1.0,
+        "delayMs": 0.0,
+        "band": "primary",
+        "crossoverHz": CROSSOVER_DEFAULT,
+        # Where the speaker physically is, as the user placed it on the stage:
+        # x from -1 (hard left) to +1 (hard right), y from 0 (close) to 1 (far).
+        "posX": 0.0,
+        "posY": 0.4,
+        "measured": None,
+        "notes": "",
+    }
+
+
+def cmd_init(args):
+    force = "--force" in args
+    if os.path.exists(PROFILE) and not force:
+        die("profile already exists; pass --force to overwrite or use 'sync'")
+    devices = detect()
+    live = [d for d in devices["speakers"] if d["state"] == "live"]
+    if not live:
+        die("no usable speakers detected")
+    profile = {
+        "version": 1,
+        "name": "Jetti Speaker",
+        "makeDefault": True,
+        "speakers": [blank_speaker(d, i, len(live)) for i, d in enumerate(live)],
+        "calibration": None,
+        "ai": None,
+    }
+    save(profile)
+    json.dump(profile, sys.stdout, indent=2)
+    print()
+
+
+def cmd_sync(args):
+    """Refresh the speaker list against reality, preserving every tuning value."""
+    profile = load() or {
+        "version": 1, "name": "Jetti Speaker", "makeDefault": True,
+        "speakers": [], "calibration": None, "ai": None,
+    }
+    devices = detect()
+    live = [d for d in devices["speakers"] if d["state"] == "live"]
+    by_key = {s.get("key"): s for s in profile.get("speakers", [])}
+
+    ignored = set(profile.get("ignored") or [])
+    live = [d for d in live if d["key"] not in ignored]
+
+    merged = []
+    for i, d in enumerate(live):
+        prior = by_key.get(d["key"])
+        if prior:
+            # Keep the tuning; refresh only what the hardware is authoritative on.
+            prior["sink"] = d["sink"]
+            prior["label"] = d["label"]
+            prior["kind"] = d["kind"]
+            prior["present"] = True
+            prior.setdefault("band", "primary")
+            prior.setdefault("crossoverHz", CROSSOVER_DEFAULT)
+            prior.setdefault("posX", 0.0)
+            prior.setdefault("posY", 0.4)
+            merged.append(prior)
+        else:
+            # New arrival during a rescan: detected, listed, but left out of
+            # the group until the user turns it on.
+            merged.append(blank_speaker(d, i, len(live), enabled=False))
+
+    # A speaker that is not here right now keeps its tuning but is marked
+    # absent, so unplugging a headset for an hour does not discard its
+    # calibration. One that carries no tuning worth preserving is dropped
+    # instead -- otherwise every device that ever appeared (including the four
+    # dead HDMI outputs a card exposes while in pro-audio) accumulates in the
+    # list forever as an identical-looking ghost.
+    for key, prior in by_key.items():
+        if key in {d["key"] for d in live}:
+            continue
+        worth_keeping = (
+            (prior.get("measured") or {}).get("heard")
+            or (prior.get("notes") or "").strip()
+            or abs(float(prior.get("gain", 1.0)) - 1.0) > 0.001
+            or abs(float(prior.get("delayMs", 0.0))) > 0.001
+        )
+        if not worth_keeping:
+            continue
+        prior["present"] = False
+        prior["enabled"] = False
+        merged.append(prior)
+
+    profile["speakers"] = merged
+    save(profile)
+    json.dump(profile, sys.stdout, indent=2)
+    print()
+
+
+def cmd_show(args):
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    json.dump(profile, sys.stdout, indent=2)
+    print()
+
+
+def find_speaker(profile, key):
+    for s in profile.get("speakers", []):
+        if s.get("key") == key or s.get("sink") == key:
+            return s
+    die("no such speaker in profile: %s" % key)
+
+
+def cmd_set(args):
+    if len(args) < 3:
+        die("usage: jspeaker profile set <speaker-key> <field> <value>")
+    key, field, value = args[0], args[1], " ".join(args[2:])
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    sp = find_speaker(profile, key)
+
+    if field == "enabled":
+        sp["enabled"] = value.lower() in ("1", "true", "yes", "on")
+    elif field == "channel":
+        if value not in ROLES:
+            die("channel must be one of: %s" % ", ".join(ROLES))
+        sp["channel"] = value
+    elif field == "gain":
+        try:
+            g = float(value)
+        except ValueError:
+            die("gain must be a number")
+        # Above 1.0 this is a boost, not a trim. A small speaker crossed over
+        # high has real headroom for it -- the bass that would have made it
+        # distort is already gone -- which is exactly the case this exists for:
+        # a laptop tweeter sitting 18 dB below the primary at the listening
+        # position cannot be balanced within unity gain.
+        if not 0.0 <= g <= GAIN_MAX:
+            die("gain must be between 0.0 and %g" % GAIN_MAX)
+        sp["gain"] = round(g, 4)
+    elif field == "delayMs":
+        try:
+            d = float(value)
+        except ValueError:
+            die("delayMs must be a number")
+        # PipeWire allocates the delay buffer up front; an absurd value would
+        # ask for hundreds of megabytes and fail at a confusing distance.
+        if not 0.0 <= d <= 2000.0:
+            die("delayMs must be between 0 and 2000")
+        sp["delayMs"] = round(d, 3)
+    elif field == "band":
+        if value not in BANDS:
+            die("band must be one of: %s" % ", ".join(BANDS))
+        sp["band"] = value
+    elif field == "crossoverHz":
+        try:
+            f = float(value)
+        except ValueError:
+            die("crossoverHz must be a number")
+        if not CROSSOVER_MIN <= f <= CROSSOVER_MAX:
+            die("crossoverHz must be between %g and %g" % (CROSSOVER_MIN, CROSSOVER_MAX))
+        sp["crossoverHz"] = round(f, 1)
+    elif field in ("posX", "posY"):
+        try:
+            v = float(value)
+        except ValueError:
+            die("%s must be a number" % field)
+        lo, hi = (-1.0, 1.0) if field == "posX" else (0.0, 1.0)
+        if not lo <= v <= hi:
+            die("%s must be between %g and %g" % (field, lo, hi))
+        sp[field] = round(v, 3)
+        # Position can drive the stereo image, but only for a supporting
+        # speaker dragged to a hard edge. Two guards, both learned the hard way:
+        #
+        #  * The primary is never narrowed. It carries the bass and the main
+        #    image; assigning it one channel would silently drop the other.
+        #  * The threshold is deliberately near the edge (0.75, not 0.5), so
+        #    nudging a speaker on the stage cannot quietly turn it mono.
+        #
+        # Set `channel` explicitly to override either way.
+        if field == "posX" and sp.get("band", "primary") != "primary":
+            if v <= -0.75:
+                sp["channel"] = "left"
+            elif v >= 0.75:
+                sp["channel"] = "right"
+            else:
+                sp["channel"] = "stereo"
+    elif field == "label":
+        sp["label"] = value[:80]
+    elif field == "notes":
+        sp["notes"] = value[:500]
+    else:
+        die("unknown field: %s" % field)
+
+    save(profile)
+    json.dump(sp, sys.stdout, indent=2)
+    print()
+
+
+def cmd_pos(args):
+    """Set both coordinates at once.
+
+    Dragging a speaker on the stage moves it in x and y together; two separate
+    commands would leave the profile briefly holding half a move, and the graph
+    watches that file.
+    """
+    if len(args) < 3:
+        die("usage: jspeaker profile pos <speaker-key> <x> <y>")
+    key, xs, ys = args[0], args[1], args[2]
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    sp = find_speaker(profile, key)
+    try:
+        x, y = float(xs), float(ys)
+    except ValueError:
+        die("x and y must be numbers")
+    if not -1.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+        die("x must be -1..1 and y must be 0..1")
+    sp["posX"], sp["posY"] = round(x, 3), round(y, 3)
+    if sp.get("band", "primary") != "primary":
+        if x <= -0.75:
+            sp["channel"] = "left"
+        elif x >= 0.75:
+            sp["channel"] = "right"
+        else:
+            sp["channel"] = "stereo"
+    save(profile)
+    json.dump(sp, sys.stdout, indent=2)
+    print()
+
+
+def cmd_suggest(args):
+    """Apply the roles calibration worked out, without involving an agent."""
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    applied = []
+    for sp in profile.get("speakers", []):
+        m = sp.get("measured") or {}
+        band = m.get("suggestedBand")
+        if not band:
+            continue
+        sp["band"] = band
+        if band == "tweeter" and m.get("suggestedCrossoverHz"):
+            sp["crossoverHz"] = float(m["suggestedCrossoverHz"])
+        if m.get("suggestedDelayMs") is not None:
+            sp["delayMs"] = round(float(m["suggestedDelayMs"]), 2)
+        applied.append("%s -> %s" % (sp["label"], band))
+    if not applied:
+        die("nothing measured yet -- run 'jspeaker calibrate' first")
+    save(profile)
+    for line in applied:
+        print(line)
+
+
+def cmd_forget(args):
+    """Remove a speaker from the profile.
+
+    `sync` re-adds anything currently present, so forgetting a live speaker is
+    only useful together with disabling it -- this exists for outputs that are
+    not real speakers at all, where carrying the entry (and its gain) forever is
+    just clutter.
+    """
+    if not args:
+        die("usage: jspeaker profile forget <speaker-key>")
+    key = args[0]
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    before = len(profile.get("speakers", []))
+    profile["speakers"] = [s for s in profile.get("speakers", [])
+                           if s.get("key") != key and s.get("sink") != key]
+    if len(profile["speakers"]) == before:
+        die("no such speaker in profile: %s" % key)
+    # Remember the decision, or the next sync brings it straight back.
+    ignored = set(profile.get("ignored") or [])
+    ignored.add(key)
+    profile["ignored"] = sorted(ignored)
+    save(profile)
+    print("forgot %s" % key)
+
+
+def cmd_unhide(args):
+    """Clear the ignored list so forgotten outputs can be detected again."""
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    hidden = list(profile.get("ignored") or [])
+    if not hidden:
+        print("nothing is hidden")
+        return
+    profile["ignored"] = []
+    save(profile)
+    for key in hidden:
+        print("unhid %s" % key)
+
+
+def cmd_setopt(args):
+    if len(args) < 2:
+        die("usage: jspeaker profile setopt <field> <value>")
+    field, value = args[0], " ".join(args[1:])
+    profile = load()
+    if profile is None:
+        die("no profile yet -- run 'jspeaker profile init'")
+    if field == "makeDefault":
+        profile["makeDefault"] = value.lower() in ("1", "true", "yes", "on")
+    elif field == "name":
+        profile["name"] = value[:80]
+    else:
+        die("unknown option: %s" % field)
+    save(profile)
+    json.dump(profile, sys.stdout, indent=2)
+    print()
+
+
+COMMANDS = {
+    "init": cmd_init, "sync": cmd_sync, "show": cmd_show,
+    "set": cmd_set, "setopt": cmd_setopt, "pos": cmd_pos,
+    "suggest": cmd_suggest, "forget": cmd_forget, "unhide": cmd_unhide,
+}
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        print("\nCommands: %s" % ", ".join(COMMANDS))
+        raise SystemExit(0)
+    cmd = COMMANDS.get(argv[0])
+    if not cmd:
+        die("unknown command: %s" % argv[0])
+    cmd(argv[1:])

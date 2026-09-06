@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Stream live output levels for every speaker in the group.
+
+Runs one capture per speaker and writes a rolling JSON snapshot that the panel
+watches, so the meter shows what each speaker is *actually* being sent rather
+than what the profile says it should be. That distinction matters: a speaker
+whose link has dropped keeps its settings and goes flat here, which is the
+fastest way to notice it has fallen out of the group.
+
+Levels are RMS over a short window, in dBFS, plus a peak that decays slowly so
+transients stay readable on a chart that updates a few times a second.
+"""
+
+import json
+import math
+import os
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-jetti-speaker")
+CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "omarchy", "jetti-speaker",
+)
+PROFILE = os.path.join(CONFIG, "profile.json")
+LEVELS = os.path.join(RUNTIME, "levels.json")
+
+RATE = 48000
+WINDOW = 0.08                      # seconds per reported sample
+CHUNK = int(RATE * WINDOW) * 2     # bytes: s16 mono
+FLOOR_DB = -70.0
+PEAK_DECAY_DB = 24.0               # dB per second
+
+# One colour per speaker, walked in order. Green through purple, matching the
+# logo: the group's own palette rather than the desktop theme's.
+COLOURS = ["#00FF41", "#A855F7", "#3BD98A", "#C084FC", "#7C3AED", "#86EFAC",
+           "#E879F9", "#22C55E"]
+
+
+def db(value):
+    if value <= 1e-7:
+        return FLOOR_DB
+    return max(FLOOR_DB, 20.0 * math.log10(value))
+
+
+def load_speakers():
+    try:
+        with open(PROFILE) as fh:
+            profile = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    out = []
+    for sp in profile.get("speakers", []):
+        if sp.get("enabled") and sp.get("sink"):
+            out.append({"key": sp["key"], "label": sp.get("label") or sp["sink"],
+                        "sink": sp["sink"], "band": sp.get("band", "primary")})
+    return out
+
+
+class Tap:
+    """One speaker's capture stream."""
+
+    def __init__(self, speaker, colour):
+        self.speaker = speaker
+        self.colour = colour
+        self.rms_db = FLOOR_DB
+        self.peak_db = FLOOR_DB
+        self.proc = subprocess.Popen(
+            ["pw-record", "--target", speaker["sink"],
+             "-P", "stream.capture.sink=true",
+             "--rate", str(RATE), "--channels", "1", "--format", "s16",
+             "--raw", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.buffer = b""
+
+    def poll(self, elapsed):
+        # Decay the peak first, so a stream that has gone quiet falls away
+        # instead of holding its last transient forever.
+        self.peak_db = max(FLOOR_DB, self.peak_db - PEAK_DECAY_DB * elapsed)
+        try:
+            data = self.proc.stdout.read(CHUNK * 4)
+        except (BlockingIOError, ValueError):
+            data = None
+        if not data:
+            # No audio at all means silence, not a stale reading.
+            self.rms_db = max(FLOOR_DB, self.rms_db - PEAK_DECAY_DB * elapsed)
+            return
+        self.buffer += data
+        usable = len(self.buffer) - (len(self.buffer) % 2)
+        if usable < 2:
+            return
+        samples = struct.unpack("<%dh" % (usable // 2), self.buffer[:usable])
+        self.buffer = self.buffer[usable:]
+        total = 0.0
+        peak = 0
+        for s in samples:
+            total += float(s) * s
+            if abs(s) > peak:
+                peak = abs(s)
+        self.rms_db = db(math.sqrt(total / len(samples)) / 32768.0)
+        self.peak_db = max(self.peak_db, db(peak / 32768.0))
+
+    def stop(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+def write(taps, running):
+    payload = {
+        "at": time.time(),
+        "running": running,
+        "floorDb": FLOOR_DB,
+        "speakers": [
+            {"key": t.speaker["key"], "label": t.speaker["label"],
+             "band": t.speaker["band"], "colour": t.colour,
+             "rmsDb": round(t.rms_db, 1), "peakDb": round(t.peak_db, 1)}
+            for t in taps
+        ],
+    }
+    tmp = LEVELS + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, LEVELS)
+    except OSError:
+        pass
+
+
+def main():
+    os.makedirs(RUNTIME, exist_ok=True)
+    speakers = load_speakers()
+    if not speakers:
+        write([], False)
+        return
+
+    taps = [Tap(sp, COLOURS[i % len(COLOURS)]) for i, sp in enumerate(speakers)]
+    stopping = {"now": False}
+
+    def handle(_sig, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, handle)
+    signal.signal(signal.SIGINT, handle)
+
+    last = time.monotonic()
+    try:
+        while not stopping["now"]:
+            time.sleep(WINDOW)
+            now = time.monotonic()
+            elapsed = now - last
+            last = now
+            for t in taps:
+                t.poll(elapsed)
+            write(taps, True)
+    finally:
+        for t in taps:
+            t.stop()
+        write(taps, False)
+
+
+if __name__ == "__main__":
+    main()

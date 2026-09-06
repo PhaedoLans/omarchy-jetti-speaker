@@ -1,0 +1,199 @@
+#!/bin/bash
+# Unlock speakers that a card's active profile is hiding, and put it back.
+#
+# Some outputs -- a monitor's audio over DisplayPort, an S/PDIF jack -- exist in
+# hardware but are invisible because the sound card is in a profile that does
+# not expose them. On a shared HDA codec the usual profiles are mutually
+# exclusive, so using laptop speakers AND monitor speakers together needs the
+# card's "pro-audio" profile, which exposes every output at once.
+#
+# That trade is real: pro-audio gives up automatic jack detection and hardware
+# volume on that card. So this never runs on its own -- the user asks for it,
+# and the previous profile is recorded so one command undoes it.
+
+set -uo pipefail
+source "$(dirname "$(readlink -f "$0")")/../lib/jspeaker-common.sh"
+
+usage() {
+  cat <<USAGE
+Usage: jspeaker card <command>
+
+  unlock <card> [profile]   switch a card to a profile that exposes more outputs
+                            (defaults to the profile jspeaker-devices recommends)
+  revert [card]             restore the profile in place before unlocking
+  list                      show what was changed and what can be restored
+USAGE
+}
+
+# Remember the profile a card had before we touched it, once. Unlocking twice
+# must not overwrite the original with our own value and strand the user.
+remember() {
+  local card="$1" prev="$2" existing
+  existing="$(jq -r --arg c "$card" '.[$c] // empty' "$JSPK_CARDS" 2>/dev/null)"
+  [[ -n $existing ]] && return 0
+  local base='{}'
+  [[ -f $JSPK_CARDS ]] && base="$(cat "$JSPK_CARDS")"
+  jq --arg c "$card" --arg p "$prev" '.[$c] = $p' <<<"$base" | jspeaker_write_json "$JSPK_CARDS"
+}
+
+card_unlock() {
+  local card="${1:-}" profile="" verify=0 arg
+  for arg in "${@:2}"; do
+    case "$arg" in
+    --verify) verify=1 ;;
+    --no-verify) verify=0 ;;
+    *) profile="$arg" ;;
+    esac
+  done
+  [[ -n $card ]] || jspeaker_die "usage: jspeaker card unlock <card> [profile]"
+
+  local info
+  info="$(pactl -f json list cards | jq -c --arg c "$card" '.[] | select(.name == $c)')"
+  [[ -n $info ]] || jspeaker_die "no such card: $card"
+
+  if [[ -z $profile ]]; then
+    profile="$("$(dirname "$(readlink -f "$0")")/jspeaker-devices" |
+      jq -r --arg c "$card" '
+        [.speakers[] | select(.card == $c and .state == "locked")][0].unlock.profile // empty')"
+    [[ -n $profile ]] || jspeaker_die "nothing locked on $card -- no profile to switch to"
+  fi
+
+  jq -e --arg p "$profile" '.profiles[$p].available == true' <<<"$info" >/dev/null 2>&1 ||
+    jspeaker_die "profile '$profile' is not available on $card"
+
+  local prev
+  prev="$(jq -r '.active_profile' <<<"$info")"
+  if [[ $prev == "$profile" ]]; then
+    echo "jspeaker: $card is already on $profile"
+    return 0
+  fi
+
+  remember "$card" "$prev"
+  pactl set-card-profile "$card" "$profile" ||
+    jspeaker_die "could not switch $card to $profile"
+
+  # Give the session manager a moment to create the new sinks, then fold them
+  # into the profile so they are immediately selectable.
+  sleep 1.5
+  "$(dirname "$(readlink -f "$0")")/jspeaker-profile" sync >/dev/null 2>&1
+
+  # Exposing a sink is not the same as producing sound. On at least one Intel
+  # codec every pro-audio output appeared and none of them played until an
+  # unrelated mixer switch was fixed -- and the switch cost the user their
+  # working laptop speakers in the meantime. When asked to verify, measure what
+  # was just exposed and undo the whole thing if nothing was heard, rather than
+  # leaving someone with fewer speakers than they started with.
+  if (( verify )); then
+    local bin new_sinks sink heard=0 probed=0
+    bin="$(dirname "$(readlink -f "$0")")"
+    new_sinks="$("$bin/jspeaker-devices" |
+      jq -r --arg c "$card" '.speakers[] | select(.card == $c and .sink != null) | .sink')"
+    if [[ -n $new_sinks ]]; then
+      echo "     checking whether the new outputs actually produce sound..."
+      while IFS= read -r sink; do
+        [[ -n $sink ]] || continue
+        probed=$((probed + 1))
+        if "$bin/jspeaker-calibrate" --probe "$sink" --volume 55 >/dev/null 2>&1; then
+          heard=1
+          echo "     heard: $sink"
+        else
+          echo "     silent: $sink"
+        fi
+      done <<<"$new_sinks"
+    fi
+    if (( probed > 0 && heard == 0 )); then
+      echo "jspeaker: nothing on $card produced sound in $profile -- reverting" >&2
+      pactl set-card-profile "$card" "$prev" 2>/dev/null
+      forget_profile_pin "$card"
+      jq --arg c "$card" 'del(.[$c])' "$JSPK_CARDS" | jspeaker_write_json "$JSPK_CARDS"
+      sleep 1
+      "$bin/jspeaker-profile" sync >/dev/null 2>&1
+      echo "jspeaker: $card restored to $prev" >&2
+      return 3
+    fi
+  fi
+
+  echo "jspeaker: $card -> $profile (was $prev)"
+  if [[ $profile == "pro-audio" ]]; then
+    echo "     pro-audio exposes every output on this card at once."
+    echo "     Jack detection and hardware volume are inactive until you revert."
+  fi
+  echo "     Undo with: jspeaker card revert $card"
+}
+
+# Undo WirePlumber's memory of a profile choice.
+#
+# `pactl set-card-profile` changes the card now, but WirePlumber separately
+# remembers the last profile per card in its own state file and re-applies it
+# whenever it restarts. That made revert look like it worked and then silently
+# hand the card back to pro-audio later. Dropping the pin -- rather than pinning
+# the old value -- lets WirePlumber choose the card's highest-priority available
+# profile again, which is what it did before anything was unlocked.
+forget_profile_pin() {
+  local card="$1"
+  local state="${XDG_STATE_HOME:-$HOME/.local/state}/wireplumber/default-profile"
+  [[ -f $state ]] || return 0
+  grep -q "^${card}=" "$state" 2>/dev/null || return 0
+
+  local tmp
+  tmp="$(mktemp "${state}.XXXXXX")" || return 0
+  grep -v "^${card}=" "$state" >"$tmp" && mv -f "$tmp" "$state" || { rm -f "$tmp"; return 0; }
+
+  # WirePlumber holds the pin in memory too, and would write it back out. A
+  # reload is the only way to make it read the file we just corrected.
+  if systemctl --user is-active wireplumber >/dev/null 2>&1; then
+    systemctl --user restart wireplumber >/dev/null 2>&1
+    sleep 3
+  fi
+  echo "     cleared WirePlumber's saved profile for this card"
+}
+
+card_revert() {
+  local card="${1:-}"
+  [[ -f $JSPK_CARDS ]] || jspeaker_die "nothing to revert"
+
+  local cards
+  if [[ -n $card ]]; then
+    cards="$card"
+  else
+    cards="$(jq -r 'keys[]' "$JSPK_CARDS" 2>/dev/null)"
+  fi
+  [[ -n $cards ]] || jspeaker_die "nothing to revert"
+
+  local c prev
+  while IFS= read -r c; do
+    [[ -n $c ]] || continue
+    prev="$(jq -r --arg c "$c" '.[$c] // empty' "$JSPK_CARDS")"
+    [[ -n $prev ]] || { echo "jspeaker: no saved profile for $c" >&2; continue; }
+    if pactl set-card-profile "$c" "$prev" 2>/dev/null; then
+      echo "jspeaker: $c -> $prev (restored)"
+      forget_profile_pin "$c"
+      jq --arg c "$c" 'del(.[$c])' "$JSPK_CARDS" | jspeaker_write_json "$JSPK_CARDS"
+    else
+      echo "jspeaker: could not restore $c to $prev" >&2
+    fi
+  done <<<"$cards"
+
+  sleep 1.0
+  "$(dirname "$(readlink -f "$0")")/jspeaker-profile" sync >/dev/null 2>&1
+}
+
+card_list() {
+  local saved='{}'
+  [[ -f $JSPK_CARDS ]] && saved="$(cat "$JSPK_CARDS")"
+  pactl -f json list cards | jq --argjson saved "$saved" '
+    map({
+      card: .name,
+      active: .active_profile,
+      restoreTo: ($saved[.name] // null),
+      canUnlock: [.profiles | to_entries[] | select(.value.available and .value.sinks > 0) | .key]
+    })'
+}
+
+case "${1:-list}" in
+unlock) shift; card_unlock "$@" ;;
+revert) shift; card_revert "$@" ;;
+list)   card_list ;;
+-h | --help) usage ;;
+*) usage; exit 1 ;;
+esac

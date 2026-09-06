@@ -1,0 +1,4 @@
+#!/bin/bash
+DATA="$(dirname "$(readlink -f "$0")")/data"
+[[ $* == "-l" ]] || { echo "aplay stub: unexpected: $*" >&2; exit 64; }
+cat "$DATA/aplay.txt"

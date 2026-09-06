@@ -1,0 +1,461 @@
+#!/bin/bash
+# Build, tear down, and report the Jetti Speaker PipeWire graph.
+#
+#   apps -> jetti_speaker (null sink) -> monitor -> N x pw-loopback -> real sinks
+#
+# Each loopback owns one speaker and carries that speaker's delay, channel
+# role, and gain, so speakers stay independently tunable while sharing one
+# clock and one virtual device.
+
+set -uo pipefail
+source "$(dirname "$(readlink -f "$0")")/../lib/jspeaker-common.sh"
+
+usage() {
+  cat <<USAGE
+Usage: jspeaker graph <command>
+
+  apply     (re)build the graph from the saved profile
+  stop      tear the graph down and restore the previous default sink
+  status    print the live graph as JSON
+  restart   stop, then apply
+USAGE
+}
+
+# --- teardown ---------------------------------------------------------------
+
+# Tear down only the fan-out, leaving the virtual sink in place.
+#
+# This distinction is the whole point: the sink is the device applications are
+# connected to. Destroying it to change one speaker's delay pulls the device out
+# from under whatever is playing -- the browser loses its output mid-stream and
+# resyncs against a clock that vanished, which comes out as garbled, slow-motion
+# playback -- and leaves EasyEffects pointing at a sink that no longer exists.
+# Retuning touches the loopbacks and crossovers only.
+graph_stop_streams() {
+  local f
+  for f in "$JSPK_PIDS"/*.pid "$JSPK_PIDS"/*.xo.pid; do
+    [[ -e $f ]] || continue
+    jspeaker_kill_pidfile "$f"
+  done
+  rm -f "$JSPK_RUNTIME"/xo-*.conf
+}
+
+graph_stop() {
+  local f
+  for f in "$JSPK_PIDS"/*.pid "$JSPK_PIDS"/*.xo.pid; do
+    [[ -e $f ]] || continue
+    jspeaker_kill_pidfile "$f"
+  done
+  rm -f "$JSPK_RUNTIME"/xo-*.conf
+
+  # Put the default sink back before removing ours, so applications that are
+  # watching get moved somewhere real instead of briefly having nowhere to go.
+  local prev
+  prev="$(cat "$JSPK_RUNTIME/previous-default-sink" 2>/dev/null)"
+  if [[ -n $prev ]] && pactl list short sinks | cut -f2 | grep -qxF "$prev"; then
+    pactl set-default-sink "$prev" >/dev/null 2>&1
+  fi
+  rm -f "$JSPK_RUNTIME/previous-default-sink"
+
+  for f in "$JSPK_MODULES"/*.mod; do
+    [[ -e $f ]] || continue
+    jspeaker_unload_modulefile "$f"
+  done
+
+  # A stale sink from a killed session would block the next apply.
+  local m
+  for m in $(pactl -f json list modules 2>/dev/null |
+    jq -r --arg s "$JSPK_SINK" '.[] | select(.argument != null and (.argument | tostring | contains($s))) | .index'); do
+    pactl unload-module "$m" 2>/dev/null
+  done
+
+  graph_write_status "stopped"
+}
+
+# --- construction -----------------------------------------------------------
+
+# Translate a speaker's channel role into the capture/playback wiring that
+# realises it. "left" means this speaker reproduces the left channel only, and
+# reproduces it on every driver it has -- which is what you want when the
+# speaker physically sits on your left.
+# Every node this plugin creates asks for the same buffer size.
+#
+# Without this, pw-loopback sizes its quantum to the delay it was asked for: a
+# 2 ms delay makes it request ~32 samples, that becomes the *graph's* quantum
+# because the whole fan-out shares one driver, and a card that cannot service a
+# 0.67 ms period starts xrunning continuously. The audible result is garbled,
+# slow audio -- and since players sync video to the audio clock, slow-motion
+# video. Pinning the quantum keeps a delay a delay instead of a latency request.
+JSPK_QUANTUM="1024/48000"
+
+role_capture_props() {
+  case "$1" in
+  left)   echo "stream.capture.sink=true target.object=$JSPK_SINK stream.dont-remix=true audio.position=[FL] node.latency=$JSPK_QUANTUM" ;;
+  right)  echo "stream.capture.sink=true target.object=$JSPK_SINK stream.dont-remix=true audio.position=[FR] node.latency=$JSPK_QUANTUM" ;;
+  mono)   echo "stream.capture.sink=true target.object=$JSPK_SINK audio.position=[MONO] node.latency=$JSPK_QUANTUM" ;;
+  *)      echo "stream.capture.sink=true target.object=$JSPK_SINK audio.position=[FL,FR] node.latency=$JSPK_QUANTUM" ;;
+  esac
+}
+
+role_channels() {
+  case "$1" in
+  left | right | mono) echo "1" ;;
+  *) echo "2" ;;
+  esac
+}
+
+role_map() {
+  case "$1" in
+  left)  echo "[FL]" ;;
+  right) echo "[FR]" ;;
+  mono)  echo "[MONO]" ;;
+  *)     echo "[FL,FR]" ;;
+  esac
+}
+
+# pw-loopback has no volume flag, so gain is applied to the playback node after
+# it exists. Two things matter here:
+#
+#  * The node is addressed by node.name through wpctl, not as a PulseAudio
+#    sink-input. With node.autoconnect=false (see graph_apply) the stream is
+#    never placed by the session manager, so it is not a sink-input at all.
+#  * wpctl's scale is cubic, like PulseAudio's. The profile's gain is a linear
+#    amplitude, because that is what the measurement maths produces
+#    (10^(dB/20)). Passing it straight to wpctl would cube it -- a gain of 0.25
+#    meant as -12 dB would land as -36 dB. Hence the cube root.
+node_id_for() {
+  local node="$1" tries id
+  for ((tries = 0; tries < 40; tries++)); do
+    id="$(pw-dump 2>/dev/null |
+      jq -r --arg n "$node" '.[] | select(.info.props."node.name" == $n) | .id' | head -1)"
+    [[ -n $id && $id != null ]] && { echo "$id"; return 0; }
+    sleep 0.05
+  done
+  return 1
+}
+
+apply_gain() {
+  local node="$1" gain="$2" id cubed
+  id="$(node_id_for "output.$node")" || return 1
+  cubed="$(awk -v g="$gain" 'BEGIN {
+    if (g < 0) g = 0; if (g > 4.0) g = 4.0;
+    printf "%.6f", (g <= 0 ? 0 : exp(log(g) / 3.0))
+  }')"
+  wpctl set-volume "$id" "$cubed" >/dev/null 2>&1
+}
+
+# Link a loopback's outputs straight onto the target sink's inputs.
+#
+# The session manager is deliberately cut out of this decision. Left to place
+# the stream itself, another audio manager -- EasyEffects, in the case that
+# prompted this -- can capture a stream aimed at one sink and route it to its
+# own, and if that manager's own output feeds the group sink the result is a
+# cycle: group sink -> loopback -> other sink -> group sink. Explicit links cannot be
+# intercepted, so the route is what the profile says it is.
+#
+# Port names are read from the graph rather than assumed: a normal sink exposes
+# playback_FL/FR while a card in pro-audio exposes playback_AUX0/AUX1, and a
+# single-channel role has one output to fan across both.
+link_nodes() {
+  local src="$1" sink="$2" tries outs ins n_out n_in i
+  for ((tries = 0; tries < 60; tries++)); do
+    outs="$(pw-link -o 2>/dev/null | grep -F "$src:" || true)"
+    ins="$(pw-link -i 2>/dev/null | grep -F "$sink:" || true)"
+    [[ -n $outs && -n $ins ]] && break
+    sleep 0.05
+  done
+  [[ -n $outs && -n $ins ]] || { echo "jspeaker: no ports to link $src -> $sink" >&2; return 1; }
+
+  mapfile -t OUT_PORTS <<<"$outs"
+  mapfile -t IN_PORTS <<<"$ins"
+  n_out=${#OUT_PORTS[@]}
+  n_in=${#IN_PORTS[@]}
+
+  for ((i = 0; i < n_in; i++)); do
+    # One output fans to every input (mono role); otherwise pair them in order.
+    local src="${OUT_PORTS[$((n_out == 1 ? 0 : i % n_out))]}"
+    pw-link "$src" "${IN_PORTS[$i]}" >/dev/null 2>&1
+  done
+}
+
+# Give a speaker its own crossover.
+#
+# A tweeter is high-passed and a bass speaker low-passed, each with two
+# cascaded biquads at Q=0.707 -- a 4th-order Linkwitz-Riley, 24 dB/octave. Two
+# sections rather than one because the whole point is keeping bass out of a
+# driver that distorts on it, and 12 dB/octave still lets an audible amount
+# through an octave below the crossover.
+#
+# The filter runs in its own `pipewire -c` process, so it is managed exactly
+# like a loopback: one pid file, killed on teardown. Its playback side is
+# node.autoconnect=false for the same reason the loopbacks are -- nothing else
+# gets to decide where it lands.
+spawn_crossover() {
+  local node="$1" band="$2" freq="$3" label="$4"
+  local conf="$JSPK_RUNTIME/xo-$node.conf"
+  local filt="jsxo_$node"
+  local kind
+
+  case "$band" in
+  tweeter) kind="bq_highpass" ;;
+  bass)    kind="bq_lowpass" ;;
+  *) return 1 ;;
+  esac
+
+  cat >"$conf" <<CONF
+context.properties = { log.level = 0 }
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+    { name = libpipewire-module-rt args = { } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Jetti $band"
+            media.name       = "Jetti Speaker crossover"
+            filter.graph = {
+                nodes = [
+                    { name = f1L type = builtin label = $kind control = { "Freq" = $freq "Q" = 0.707 } }
+                    { name = f2L type = builtin label = $kind control = { "Freq" = $freq "Q" = 0.707 } }
+                    { name = f1R type = builtin label = $kind control = { "Freq" = $freq "Q" = 0.707 } }
+                    { name = f2R type = builtin label = $kind control = { "Freq" = $freq "Q" = 0.707 } }
+                ]
+                links = [
+                    { output = "f1L:Out" input = "f2L:In" }
+                    { output = "f1R:Out" input = "f2R:In" }
+                ]
+                inputs  = [ "f1L:In" "f1R:In" ]
+                outputs = [ "f2L:Out" "f2R:Out" ]
+            }
+            capture.props = {
+                node.name      = "$filt"
+                media.class    = "Audio/Sink"
+                audio.position = [ FL FR ]
+                node.latency   = $JSPK_QUANTUM
+            }
+            playback.props = {
+                node.name         = "$filt.out"
+                node.autoconnect  = false
+                audio.position    = [ FL FR ]
+                stream.dont-remix = true
+                node.latency      = $JSPK_QUANTUM
+            }
+        }
+    }
+]
+CONF
+
+  setsid pipewire -c "$conf" >"$JSPK_RUNTIME/$node.xo.log" 2>&1 </dev/null &
+  echo "$!" >"$JSPK_PIDS/$node.xo.pid"
+
+  local tries
+  for ((tries = 0; tries < 80; tries++)); do
+    if pw-link -i 2>/dev/null | grep -qF "$filt:playback_FL" &&
+      pw-link -o 2>/dev/null | grep -qF "$filt.out:output_FL"; then
+      echo "$filt"
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "jspeaker: crossover for '$label' did not start: $(head -1 "$JSPK_RUNTIME/$node.xo.log" 2>/dev/null)" >&2
+  return 1
+}
+
+graph_apply() {
+  [[ -f $JSPK_PROFILE ]] || jspeaker_die "no profile yet -- run 'jspeaker profile init' first"
+  jq -e . "$JSPK_PROFILE" >/dev/null 2>&1 || jspeaker_die "profile is not valid JSON: $JSPK_PROFILE"
+
+  local enabled
+  enabled="$(jq -r '[.speakers[] | select(.enabled and .sink != null)] | length' "$JSPK_PROFILE")"
+  [[ $enabled -gt 0 ]] || jspeaker_die "no enabled speakers in the profile"
+
+  # If our sink is already up, keep it and rebuild only the fan-out. Anything
+  # playing stays connected and never notices the retune.
+  local reuse=0
+  if [[ -f $JSPK_MODULES/groupsink.mod ]] &&
+    pactl list short sinks | cut -f2 | grep -qxF "$JSPK_SINK"; then
+    reuse=1
+  fi
+
+  if (( reuse )); then
+    graph_stop_streams
+  else
+    graph_stop
+    # Remember where audio was going, so stopping restores it rather than
+    # leaving the user on whatever PipeWire picks next.
+    pactl get-default-sink >"$JSPK_RUNTIME/previous-default-sink" 2>/dev/null
+  fi
+
+  local desc mod
+  desc="$(jq -r '.name // "Jetti Speaker"' "$JSPK_PROFILE")"
+  if (( reuse )); then
+    mod="$(cat "$JSPK_MODULES/groupsink.mod")"
+  else
+  mod="$(pactl load-module module-null-sink \
+    sink_name="$JSPK_SINK" \
+    object.linger=false \
+    sink_properties="device.description=$desc device.icon_name=audio-speakers node.nick=Jetti" 2>/dev/null)" ||
+    jspeaker_die "could not create the $JSPK_SINK virtual device"
+  [[ $mod =~ ^[0-9]+$ ]] || jspeaker_die "unexpected module id from pactl: $mod"
+  echo "$mod" >"$JSPK_MODULES/groupsink.mod"
+
+  # Wait for the sink to actually exist before pointing loopbacks at it.
+  local tries
+  for ((tries = 0; tries < 40; tries++)); do
+    pactl list short sinks | cut -f2 | grep -qxF "$JSPK_SINK" && break
+    sleep 0.05
+  done
+  fi
+
+  local n=0 rows
+  rows="$(jq -c '.speakers[] | select(.enabled and .sink != null)' "$JSPK_PROFILE")"
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    local sink role gain delay label node delay_s
+    sink="$(jq -r '.sink' <<<"$row")"
+    role="$(jq -r '.channel // "stereo"' <<<"$row")"
+    gain="$(jq -r '.gain // 1.0' <<<"$row")"
+    delay="$(jq -r '.delayMs // 0' <<<"$row")"
+    label="$(jq -r '.label // .sink' <<<"$row")"
+    band="$(jq -r '.band // "primary"' <<<"$row")"
+    crossover="$(jq -r '.crossoverHz // 800' <<<"$row")"
+    # Property values reach pw-loopback as SPA JSON, where an unquoted space
+    # ends the value and the rest becomes a syntax error. Quote the value and
+    # strip the characters that would close the quote early.
+    safe_label="$(printf '%s' "$label" | tr -d '"\\' | tr -c '[:print:]' ' ' | cut -c1-60)"
+
+    # A target that vanished since the profile was written (unplugged headset,
+    # Bluetooth speaker out of range) is skipped rather than fatal: the rest of
+    # the group is still worth having.
+    if [[ $sink == "$JSPK_SINK" ]]; then
+      echo "jspeaker: refusing to feed '$JSPK_SINK' into itself" >&2
+      continue
+    fi
+
+    if ! pactl list short sinks | cut -f2 | grep -qxF "$sink"; then
+      echo "jspeaker: skipping '$label' -- sink is gone: $sink" >&2
+      continue
+    fi
+
+    node="${JSPK_LOOPBACK_PREFIX}${n}"
+    delay_s="$(awk -v d="$delay" 'BEGIN { if (d < 0) d = 0; printf "%.6f", d / 1000.0 }')"
+
+    setsid pw-loopback \
+      -n "$node" \
+      -c "$(role_channels "$role")" \
+      -m "$(role_map "$role")" \
+      -d "$delay_s" \
+      --capture-props="$(role_capture_props "$role")" \
+      --playback-props="node.autoconnect=false node.dont-reconnect=true node.latency=$JSPK_QUANTUM node.description=\"Jetti $safe_label\" media.name=\"Jetti Speaker\"" \
+      >"$JSPK_RUNTIME/$node.log" 2>&1 </dev/null &
+    echo "$!" >"$JSPK_PIDS/$node.pid"
+    if [[ $band == "primary" ]]; then
+      link_nodes "output.$node" "$sink" ||
+        echo "jspeaker: '$label' could not be linked" >&2
+    else
+      local filt
+      if filt="$(spawn_crossover "$node" "$band" "$crossover" "$label")"; then
+        link_nodes "output.$node" "$filt" ||
+          echo "jspeaker: '$label' could not reach its crossover" >&2
+        link_nodes "$filt.out" "$sink" ||
+          echo "jspeaker: '$label' crossover could not reach the speaker" >&2
+      else
+        # Better a full-range speaker than a silent one.
+        echo "jspeaker: '$label' falling back to full range" >&2
+        link_nodes "output.$node" "$sink" ||
+          echo "jspeaker: '$label' could not be linked" >&2
+      fi
+    fi
+    apply_gain "$node" "$gain"
+    n=$((n + 1))
+  done <<<"$rows"
+
+  [[ $n -gt 0 ]] || {
+    graph_stop
+    jspeaker_die "none of the profile's speakers are currently present"
+  }
+
+  if [[ "$(jq -r '.makeDefault // true' "$JSPK_PROFILE")" == "true" ]]; then
+    pactl set-default-sink "$JSPK_SINK" >/dev/null 2>&1
+  fi
+
+  graph_write_status "running"
+  echo "jspeaker: speaker group up with $n speaker(s)"
+}
+
+# --- safety ---------------------------------------------------------------
+
+# The one way this graph can hurt someone: a fan-out loopback whose playback
+# lands back on jetti_speaker feeds the sink its own monitor, and the result is a
+# hard feedback squeal at whatever volume is set. node.dont-reconnect=true is
+# meant to prevent it, but a session manager rule or a manual move can still
+# get there, so the loop is also checked for directly and broken on sight.
+graph_break_feedback() {
+  local group_idx killed=0 name pid
+  group_idx="$(pactl -f json list sinks 2>/dev/null |
+    jq -r --arg s "$JSPK_SINK" '.[] | select(.name == $s) | .index')"
+  [[ -n $group_idx ]] || return 0
+
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    name="${name#output.}"
+    [[ $name == ${JSPK_LOOPBACK_PREFIX}* ]] || continue
+    echo "jspeaker: breaking feedback loop -- '$name' was routed back into $JSPK_SINK" >&2
+    jspeaker_kill_pidfile "$JSPK_PIDS/$name.pid"
+    killed=$((killed + 1))
+  done < <(pactl -f json list sink-inputs 2>/dev/null |
+    jq -r --argjson u "$group_idx" '.[] | select(.sink == $u) | .properties."node.name" // empty')
+
+  return 0
+}
+
+# --- reporting --------------------------------------------------------------
+
+graph_write_status() {
+  local state="$1" live=0 f pid
+  graph_break_feedback
+  for f in "$JSPK_PIDS"/*.pid; do
+    [[ -e $f ]] || continue
+    # A crossover has its own pid file next to the speaker's. It is part of one
+    # speaker's chain, not another speaker, so it must not be counted here --
+    # the bar badge shows this number.
+    [[ $f == *.xo.pid ]] && continue
+    pid="$(cat "$f" 2>/dev/null)"
+    [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && live=$((live + 1))
+  done
+
+  local sink_present=false
+  pactl list short sinks 2>/dev/null | cut -f2 | grep -qxF "$JSPK_SINK" && sink_present=true
+
+  jq -n \
+    --arg state "$state" \
+    --arg sink "$JSPK_SINK" \
+    --argjson live "$live" \
+    --argjson present "$sink_present" \
+    --arg default "$(pactl get-default-sink 2>/dev/null)" \
+    --argjson profile "$(cat "$JSPK_PROFILE" 2>/dev/null || echo null)" \
+    '{
+       state: (if $state == "running" and $live > 0 then "running" else $state end),
+       sink: $sink,
+       sinkPresent: $present,
+       speakerCount: $live,
+       isDefault: ($default == $sink),
+       defaultSink: $default,
+       profile: $profile,
+       updatedAt: (now | todate)
+     }' | jspeaker_write_json "$JSPK_STATUS"
+  cat "$JSPK_STATUS"
+}
+
+case "${1:-status}" in
+apply)   shift; graph_apply "$@" ;;
+stop)    graph_stop >/dev/null; echo "jspeaker: speaker group down" ;;
+restart) graph_stop >/dev/null; graph_apply ;;
+status)  graph_write_status "$([[ -n "$(ls -A "$JSPK_PIDS" 2>/dev/null)" ]] && echo running || echo stopped)" ;;
+-h | --help) usage ;;
+*) usage; exit 1 ;;
+esac

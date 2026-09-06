@@ -1,0 +1,31 @@
+#!/bin/bash
+# Run every Jetti Speaker test. No hardware, no audio, no network.
+set -u
+cd "$(dirname "$(readlink -f "$0")")"
+
+# Importing the DSP module writes __pycache__ next to it, which then travels in
+# any copy of the plugin -- including one handed to somebody on a USB stick.
+export PYTHONDONTWRITEBYTECODE=1
+status=0
+
+echo "== dsp =="
+python3 dsp.test.py || status=1
+echo
+echo "== tune =="
+python3 tune.test.py || status=1
+echo
+echo "== profile =="
+python3 profile.test.py || status=1
+echo
+echo "== devices =="
+python3 devices.test.py || status=1
+echo
+echo "== model =="
+if command -v node >/dev/null; then
+  node model.test.mjs || status=1
+else
+  echo "  skipped (node not installed)"
+fi
+echo
+[[ $status -eq 0 ]] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
+exit $status

@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""Measure the speaker group with a microphone.
+
+Plays one exponential sweep per speaker -- all of them inside a single
+multichannel stream, so every sweep shares one unknown playback start offset
+that cancels when speakers are compared (see lib/jspeaker_dsp.py) -- while recording
+from a microphone. For each speaker it reports:
+
+  arrivalMs   when the sweep reached the mic, relative to the other speakers
+  levelDb     how loud it arrived, for gain matching
+  bands       octave-band levels, for tonal character
+  confidence  how far the correlation peak stood above the noise
+
+Nothing is applied to the graph here. The measurement is written into the
+profile, and `jspeaker tune` (or the user) decides what to do about it.
+"""
+
+import argparse
+import json
+import os
+import signal
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+# Don't scatter __pycache__ through a plugin folder the shell also scans.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(HERE, "..", "lib"))
+import jspeaker_dsp as dsp  # noqa: E402
+
+CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "omarchy", "jetti-speaker",
+)
+PROFILE = os.path.join(CONFIG, "profile.json")
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-jetti-speaker")
+CAL_SINK = "jetti_speaker_cal"
+
+# Below this, the correlation peak is not distinguishable from room noise and
+# the honest answer is "I did not hear that speaker" rather than a number.
+CONFIDENCE_FLOOR = 40.0
+# A probe asks a cruder question than calibration -- "did anything at all come
+# out of this" rather than "when exactly did it arrive" -- and it gets one sweep
+# instead of a full pass, so it needs a lower bar. Measured on real hardware:
+# a silent DisplayPort output scored 6x while working laptop speakers scored 35x,
+# which the calibration floor of 40 would have called silent too.
+PROBE_FLOOR = 18.0
+PROBE_ATTEMPTS = 2
+NOMINAL_START = 0.5     # how long we let the recorder roll before playing
+SEARCH_BACK = 0.35      # tolerance on that start
+SEARCH_FORWARD = 0.9    # covers acoustic flight plus Bluetooth's own latency
+
+
+def die(msg):
+    print("jspeaker-calibrate: %s" % msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def load_profile():
+    if not os.path.exists(PROFILE):
+        die("no profile yet -- run 'jspeaker profile init'")
+    with open(PROFILE) as fh:
+        return json.load(fh)
+
+
+def save_profile(p):
+    fd, tmp = tempfile.mkstemp(dir=CONFIG, prefix=".profile.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(p, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, PROFILE)
+
+
+def pick_mic(requested):
+    devices = json.loads(run([os.path.join(HERE, "jspeaker-devices")]).stdout or "{}")
+    mics = devices.get("mics", [])
+    if requested:
+        for m in mics:
+            if m["name"] == requested or requested in m["description"]:
+                return m
+        die("no such microphone: %s" % requested)
+    usable = [m for m in mics if m["suitable"]]
+    if not usable:
+        die("no suitable microphone found (a Bluetooth headset mic cannot be used)")
+    return usable[0]
+
+
+class CalibrationGraph:
+    """A temporary multichannel sink with one isolated channel per speaker."""
+
+    def __init__(self, speakers):
+        self.speakers = speakers
+        self.module = None
+        self.loopbacks = []
+
+    def __enter__(self):
+        n = len(self.speakers)
+        positions = ",".join(dsp_positions(n))
+        out = run([
+            "pactl", "load-module", "module-null-sink",
+            "sink_name=%s" % CAL_SINK, "channels=%d" % n,
+            "channel_map=%s" % positions, "object.linger=false",
+            "sink_properties=device.description=USL-Calibration",
+        ])
+        if out.returncode != 0 or not out.stdout.strip().isdigit():
+            die("could not create the calibration sink: %s" % out.stderr.strip())
+        self.module = out.stdout.strip()
+
+        for _ in range(40):
+            if CAL_SINK in run(["pactl", "list", "short", "sinks"]).stdout:
+                break
+            time.sleep(0.05)
+
+        short = SHORT_POSITIONS[:n]
+        for i, sp in enumerate(self.speakers):
+            # dont-remix plus a single channel position is what makes each
+            # loopback hear exactly one channel of the calibration sink, so the
+            # sweeps stay isolated even though they share one playback stream.
+            proc = subprocess.Popen([
+                "pw-loopback", "-n", "jscal%d" % i, "-c", "1", "-m", "[%s]" % short[i],
+                "-d", "0",
+                "--capture-props=stream.capture.sink=true target.object=%s "
+                "stream.dont-remix=true audio.position=[%s]" % (CAL_SINK, short[i]),
+                "--playback-props=target.object=%s node.dont-reconnect=true "
+                'media.name="USL calibration"' % sp["sink"],
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+            self.loopbacks.append((sp, proc))
+        time.sleep(1.2)
+
+        # A calibration loopback that failed to start makes its speaker measure
+        # as "not heard", which reads like a hardware problem and is not one.
+        # Surface the failure instead of silently measuring silence.
+        for sp, proc in self.loopbacks:
+            if proc.poll() is not None:
+                err = ""
+                try:
+                    err = (proc.stderr.read() or b"").decode(errors="replace").strip()
+                except Exception:
+                    pass
+                die("calibration route for '%s' failed to start: %s"
+                    % (sp["label"], err or "pw-loopback exited %d" % proc.returncode))
+
+        # Verify each route actually reached its target sink, so a hijacked or
+        # unlinked stream is reported rather than measured as silence.
+        linked = run(["pactl", "-f", "json", "list", "sink-inputs"]).stdout
+        try:
+            inputs = json.loads(linked or "[]")
+        except json.JSONDecodeError:
+            inputs = []
+        sink_index = {}
+        try:
+            for entry in json.loads(run(["pactl", "-f", "json", "list", "sinks"]).stdout or "[]"):
+                sink_index[entry.get("index")] = entry.get("name")
+        except json.JSONDecodeError:
+            pass
+        for i, (sp, _proc) in enumerate(self.loopbacks):
+            node = "output.jscal%d" % i
+            landed = next((sink_index.get(e.get("sink")) for e in inputs
+                           if (e.get("properties") or {}).get("node.name") == node), None)
+            if landed is None:
+                print("jspeaker-calibrate: warning: no playback stream for '%s'"
+                      % sp["label"], file=sys.stderr)
+            elif landed != sp["sink"]:
+                print("jspeaker-calibrate: warning: '%s' was routed to %s instead of %s"
+                      % (sp["label"], landed, sp["sink"]), file=sys.stderr)
+        return self
+
+    def __exit__(self, *exc):
+        for _sp, proc in self.loopbacks:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if self.module:
+            run(["pactl", "unload-module", self.module])
+        return False
+
+
+SHORT_POSITIONS = ["FL", "FR", "RL", "RR", "FC", "LFE", "SL", "SR"]
+LONG_POSITIONS = ["front-left", "front-right", "rear-left", "rear-right",
+                  "front-center", "lfe", "side-left", "side-right"]
+
+
+def dsp_positions(n):
+    return LONG_POSITIONS[:n]
+
+
+def alsa_card_for_sink(sink_name):
+    """Which ALSA card a sink belongs to, or None.
+
+    Needed because a card in pro-audio exposes no PipeWire volume control at
+    all, so `pactl set-sink-volume` silently does nothing and calibration plays
+    at whatever the hardware mixer happens to be set to -- which on a freshly
+    unlocked card can be alarmingly loud, or so quiet nothing is heard.
+    """
+    out = run(["pactl", "-f", "json", "list", "sinks"]).stdout
+    try:
+        for entry in json.loads(out or "[]"):
+            if entry.get("name") != sink_name:
+                continue
+            props = entry.get("properties") or {}
+            path = props.get("api.alsa.path") or ""
+            m = re.match(r"hw:(\d+)", path)
+            if m:
+                return int(m.group(1))
+            card = props.get("alsa.card")
+            if card is not None:
+                try:
+                    return int(card)
+                except (TypeError, ValueError):
+                    return None
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def sink_has_volume(sink_name):
+    out = run(["pactl", "-f", "json", "list", "sinks"]).stdout
+    try:
+        for entry in json.loads(out or "[]"):
+            if entry.get("name") == sink_name:
+                vol = entry.get("volume") or {}
+                first = next(iter(vol.values()), None)
+                return first is not None and first.get("value_percent") is not None
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return False
+
+
+def alsa_master(card, value=None):
+    """Read or set a card's Master control, returning the previous percentage."""
+    if value is None:
+        out = run(["amixer", "-c", str(card), "sget", "Master"]).stdout
+        m = re.search(r"\[(\d+)%\]", out or "")
+        return int(m.group(1)) if m else None
+    run(["amixer", "-c", str(card), "sset", "Master", "%d%%" % value])
+    return None
+
+
+def mic_volume(name):
+    out = run(["pactl", "-f", "json", "list", "sources"]).stdout
+    try:
+        for src in json.loads(out or "[]"):
+            if src.get("name") == name:
+                vol = (src.get("volume") or {})
+                first = next(iter(vol.values()), {})
+                return int(str(first.get("value_percent", "100%")).rstrip("%"))
+    except (json.JSONDecodeError, ValueError, StopIteration):
+        pass
+    return 100
+
+
+def measure_floor(name, seconds=1.2):
+    """Room noise level at the current mic gain, in dB."""
+    path = os.path.join(RUNTIME, "floor.wav")
+    if os.path.exists(path):
+        os.unlink(path)
+    proc = subprocess.Popen(
+        ["pw-record", "--target", name, "--rate", str(dsp.SAMPLE_RATE),
+         "--channels", "1", "--format", "s16", path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(seconds)
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    if not os.path.exists(path) or os.path.getsize(path) < 1024:
+        return None
+    samples, _ = dsp.read_wav_mono(path)
+    return dsp.db(dsp.rms(samples))
+
+
+def autolevel_mic(name, quiet=False):
+    """Pick a mic gain that leaves headroom for the sweep.
+
+    Laptop microphones commonly sit at 100%, where PipeWire's cubic volume
+    curve means room noise alone already clips -- and a clipped recording
+    measures the clipping, not the speaker. Walk the gain down until the noise
+    floor sits in a band that leaves room for a sweep well above it.
+    """
+    for candidate in (25, 40, 15, 60, 8, 80):
+        run(["pactl", "set-source-volume", name, "%d%%" % candidate])
+        time.sleep(0.25)
+        floor = measure_floor(name)
+        if floor is None:
+            continue
+        if -70.0 <= floor <= -28.0:
+            if not quiet:
+                print("Microphone set to %d%% (room noise %.0f dB)." % (candidate, floor))
+            return candidate, floor
+    return 25, None
+
+
+def record_and_play(wav_path, mic, duration, volume):
+    rec_path = os.path.join(RUNTIME, "capture.wav")
+    for stale in (rec_path,):
+        if os.path.exists(stale):
+            os.unlink(stale)
+
+    recorder = subprocess.Popen(
+        ["pw-record", "--target", mic["name"], "--rate", str(dsp.SAMPLE_RATE),
+         "--channels", "1", "--format", "s16", rec_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+
+    time.sleep(NOMINAL_START)
+    if recorder.poll() is not None:
+        err = (recorder.stderr.read() or b"").decode(errors="replace")
+        die("microphone capture failed to start: %s" % err.strip())
+
+    run(["pactl", "set-sink-volume", CAL_SINK, "%d%%" % volume])
+    player = subprocess.Popen(
+        ["pw-play", "--target", CAL_SINK, wav_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+    player.wait(timeout=duration + 20)
+    time.sleep(0.4)
+
+    recorder.terminate()
+    try:
+        recorder.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        recorder.kill()
+
+    if not os.path.exists(rec_path) or os.path.getsize(rec_path) < 1024:
+        die("microphone produced no audio -- is it muted?")
+    return rec_path
+
+
+def analyse(rec_path, speakers, emissions):
+    recording, rate = dsp.read_wav_mono(rec_path)
+    if rate != dsp.SAMPLE_RATE:
+        die("recorded at %d Hz, expected %d" % (rate, dsp.SAMPLE_RATE))
+
+    reference = dsp.decimate(dsp.exponential_sweep())
+    dec = dsp.decimate(recording)
+    results = []
+
+    for i, sp in enumerate(speakers):
+        centre = NOMINAL_START + emissions[i]
+        start = max(0, int((centre - SEARCH_BACK) * dsp.DECIM_RATE))
+        end = min(len(dec), int((centre + SEARCH_FORWARD + dsp.SWEEP_SECONDS) * dsp.DECIM_RATE))
+        window = dec[start:end]
+        if len(window) < len(reference) // 2:
+            results.append({"label": sp["label"], "heard": False,
+                            "reason": "recording ended early"})
+            continue
+
+        offset, _peak, confidence = dsp.matched_filter_peak(window, reference)
+        arrival_s = (start + offset) / dsp.DECIM_RATE
+        heard = confidence >= CONFIDENCE_FLOOR
+
+        # Subtracting the known emission time removes everything except the
+        # shared start offset, which cancels between speakers.
+        relative_s = arrival_s - emissions[i]
+        arrival_full = int(arrival_s * dsp.SAMPLE_RATE)
+        seg = recording[arrival_full:arrival_full + int(dsp.SWEEP_SECONDS * dsp.SAMPLE_RATE)]
+
+        results.append({
+            "key": sp["key"],
+            "label": sp["label"],
+            "heard": heard,
+            "confidence": round(confidence, 1),
+            "relativeMs": round(relative_s * 1000.0, 2),
+            "levelDb": round(dsp.db(dsp.rms(seg)), 2) if heard else None,
+            "bands": dsp.band_response(recording, arrival_full) if heard else {},
+        })
+
+    # Work out what each speaker is physically good for.
+    #
+    # A speaker's own bass-to-midrange ratio says whether it has any low end at
+    # all, independent of how loud it is or how far away it sits -- a small
+    # driver rolls off steeply below a few hundred Hz no matter the volume.
+    # Comparing that ratio between speakers picks the one that should carry the
+    # bass, and the rest become tweeters with a crossover set where their own
+    # response gives out.
+    for r in results:
+        bands = r.get("bands") or {}
+        if not r.get("heard") or not bands:
+            continue
+        def avg(keys):
+            vals = [bands[k] for k in keys if k in bands]
+            return sum(vals) / len(vals) if vals else None
+        bass = avg(["125", "250"])
+        mid = avg(["1000", "2000"])
+        if bass is None or mid is None:
+            continue
+        r["bassDb"] = round(bass, 2)
+        r["midDb"] = round(mid, 2)
+        # Negative means the speaker is weaker in the bass than in its midrange.
+        r["bassToMidDb"] = round(bass - mid, 2)
+
+        # Where does this speaker stop keeping up with itself? The lowest band
+        # still within 10 dB of its midrange is the bottom of its useful range;
+        # crossing over there stops asking it for what it cannot deliver.
+        knee = None
+        for hz in (125, 250, 500, 1000, 2000):
+            key = str(hz)
+            if key in bands and bands[key] >= mid - 10.0:
+                knee = hz
+                break
+        r["kneeHz"] = knee
+
+    graded = [r for r in results if r.get("bassToMidDb") is not None]
+    if graded:
+        best = max(g["bassToMidDb"] for g in graded)
+        for r in graded:
+            # Within 6 dB of the best low-end reach, it can carry bass too.
+            if r["bassToMidDb"] >= best - 6.0:
+                r["suggestedBand"] = "primary"
+                r["suggestedCrossoverHz"] = None
+            else:
+                r["suggestedBand"] = "tweeter"
+                # Cross over AT the knee, not above it. The knee is already the
+                # lowest band the speaker still keeps up in; starting an octave
+                # higher would throw away the best output it has. For these
+                # laptop speakers the knee is 1 kHz, which is also where they
+                # are loudest -- crossing at 2 kHz would discard exactly the
+                # range they are good at.
+                knee = r.get("kneeHz") or 500
+                r["suggestedCrossoverHz"] = float(max(200, min(2000, knee)))
+            r["weakness"] = round(best - r["bassToMidDb"], 2)
+
+    heard = [r for r in results if r.get("heard")]
+    if heard:
+        # Align everything to the speaker that arrives last: delay is only ever
+        # added, never removed, so the latest speaker is the one nothing can be
+        # done about and every other speaker waits for it.
+        latest = max(r["relativeMs"] for r in heard)
+        # Balance down to the quietest speaker: trimming what is loud is safe,
+        # whereas boosting a small driver to match a big one just makes it
+        # distort. GAIN_FLOOR caps how far that trimming goes -- past about
+        # 12 dB the imbalance is a hardware volume problem that no amount of
+        # software attenuation should silently paper over.
+        GAIN_FLOOR = 0.25
+        quietest = min(r["levelDb"] for r in heard)
+        for r in results:
+            if not r.get("heard"):
+                continue
+            r["suggestedDelayMs"] = round(max(0.0, latest - r["relativeMs"]), 2)
+            wanted = 10 ** ((quietest - r["levelDb"]) / 20.0)
+            r["suggestedGain"] = round(max(GAIN_FLOOR, min(1.0, wanted)), 3)
+            if wanted < GAIN_FLOOR:
+                r["gainNote"] = (
+                    "%.0f dB louder than the quietest speaker -- more than software "
+                    "trim should hide. Turn this speaker down at the hardware."
+                    % (r["levelDb"] - quietest))
+    return results
+
+
+def _probe_once(sink, wav, rec, mic, sweep):
+    """One sweep through `sink`, returning the matched-filter confidence."""
+    if os.path.exists(rec):
+        os.unlink(rec)
+    recorder = subprocess.Popen(
+        ["pw-record", "--target", mic["name"], "--rate", str(dsp.SAMPLE_RATE),
+         "--channels", "1", "--format", "s16", rec],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    time.sleep(NOMINAL_START)
+    try:
+        subprocess.run(["pw-play", "--target", sink, wav],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(0.4)
+    recorder.terminate()
+    try:
+        recorder.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        recorder.kill()
+    if not os.path.exists(rec) or os.path.getsize(rec) < 1024:
+        return None
+    samples, _ = dsp.read_wav_mono(rec)
+    _idx, _peak, confidence = dsp.matched_filter_peak(
+        dsp.decimate(samples), dsp.decimate(sweep))
+    return confidence
+
+
+def probe(sink, label, volume, mic_name=None):
+    """Measure one sink in isolation, changing nothing that lasts.
+
+    Answers "did that output actually make a sound", which is what unlocking a
+    hidden output needs: a card profile that exposes a sink is not proof the
+    sink produces audio. Every level it touches -- the sink's own volume, the
+    card's ALSA master, the microphone -- is put back afterwards.
+    """
+    mic = pick_mic(mic_name)
+    sweep = dsp.exponential_sweep()
+    wav = os.path.join(RUNTIME, "probe-sweep.wav")
+    rec = os.path.join(RUNTIME, "probe-capture.wav")
+    dsp.write_multichannel_wav(wav, [sweep, sweep])
+
+    had_volume = sink_has_volume(sink)
+    card = None if had_volume else alsa_card_for_sink(sink)
+    prev_master = alsa_master(card) if card is not None else None
+
+    prev_sink = None
+    if had_volume:
+        try:
+            for entry in json.loads(run(["pactl", "-f", "json", "list", "sinks"]).stdout or "[]"):
+                if entry.get("name") == sink:
+                    first = next(iter((entry.get("volume") or {}).values()), {})
+                    prev_sink = first.get("value_percent")
+        except (json.JSONDecodeError, StopIteration):
+            pass
+
+    original_mic = mic_volume(mic["name"])
+    best = 0.0
+    try:
+        autolevel_mic(mic["name"], quiet=True)
+        if had_volume:
+            run(["pactl", "set-sink-volume", sink, "%d%%" % volume])
+        elif card is not None:
+            alsa_master(card, volume)
+
+        # Best of a few sweeps: one can be spoiled by a door or a keystroke, and
+        # a false "silent" here throws away a working speaker.
+        for _attempt in range(PROBE_ATTEMPTS):
+            got = _probe_once(sink, wav, rec, mic, sweep)
+            if got is not None:
+                best = max(best, got)
+            if best >= PROBE_FLOOR:
+                break
+    finally:
+        run(["pactl", "set-source-volume", mic["name"], "%d%%" % original_mic])
+        if prev_sink:
+            run(["pactl", "set-sink-volume", sink, prev_sink])
+        if card is not None and prev_master is not None:
+            alsa_master(card, prev_master)
+
+    return {"sink": sink, "label": label,
+            "heard": best >= PROBE_FLOOR,
+            "confidence": round(best, 1),
+            "floor": PROBE_FLOOR,
+            "mic": mic["description"]}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mic", help="microphone source name (default: best built-in)")
+    ap.add_argument("--volume", type=int, default=70,
+                    help="calibration playback volume percent (default 70)")
+    ap.add_argument("--json", action="store_true", help="print results as JSON only")
+    ap.add_argument("--probe", metavar="SINK",
+                    help="measure one sink in isolation and exit; changes nothing")
+    args = ap.parse_args()
+
+    if args.probe:
+        result = probe(args.probe, args.probe, args.volume, args.mic)
+        if args.json:
+            json.dump(result, sys.stdout, indent=2)
+            print()
+        else:
+            print("%s: %s (confidence %.0fx)" % (
+                args.probe,
+                "heard" if result["heard"] else "NOT heard",
+                result.get("confidence", 0)))
+        raise SystemExit(0 if result["heard"] else 2)
+
+    profile = load_profile()
+    speakers = [s for s in profile.get("speakers", [])
+                if s.get("enabled") and s.get("sink")]
+    if not speakers:
+        die("no enabled speakers to calibrate")
+    if len(speakers) > len(SHORT_POSITIONS):
+        die("cannot calibrate more than %d speakers at once" % len(SHORT_POSITIONS))
+
+    mic = pick_mic(args.mic)
+    channels, emissions = dsp.build_calibration_signal(len(speakers))
+    duration = dsp.LEAD_SECONDS + len(speakers) * dsp.SLOT_SECONDS + dsp.TAIL_SECONDS
+
+    if not args.json:
+        print("Calibrating %d speakers using '%s'." % (len(speakers), mic["description"]))
+        print("Stay quiet for about %d seconds -- each speaker sweeps in turn.\n"
+              % (duration + 2))
+
+    # The fan-out must be down, or every speaker would also play every other
+    # speaker's sweep and the measurement would be meaningless.
+    was_running = json.loads(
+        run([os.path.join(HERE, "jspeaker-graph"), "status"]).stdout or "{}"
+    ).get("state") == "running"
+    if was_running:
+        run([os.path.join(HERE, "jspeaker-graph"), "stop"])
+
+    wav = os.path.join(RUNTIME, "sweeps.wav")
+    dsp.write_multichannel_wav(wav, channels)
+
+    original_mic_volume = mic_volume(mic["name"])
+    original_sink_volumes = {}
+    for sp in speakers:
+        out = run(["pactl", "-f", "json", "list", "sinks"]).stdout
+        try:
+            for entry in json.loads(out or "[]"):
+                if entry.get("name") == sp["sink"]:
+                    first = next(iter((entry.get("volume") or {}).values()), {})
+                    original_sink_volumes[sp["sink"]] = str(first.get("value_percent", "100%"))
+        except (json.JSONDecodeError, StopIteration):
+            pass
+
+    # A card with no PipeWire volume control is levelled through its ALSA
+    # mixer instead, and put back afterwards.
+    original_masters = {}
+    for sp in speakers:
+        if sink_has_volume(sp["sink"]):
+            continue
+        card = alsa_card_for_sink(sp["sink"])
+        if card is None or card in original_masters:
+            continue
+        prev = alsa_master(card)
+        if prev is not None:
+            original_masters[card] = prev
+
+    try:
+        autolevel_mic(mic["name"], quiet=args.json)
+        # Every speaker must contribute at a comparable hardware level, or the
+        # measured level differences would describe the volume knobs rather
+        # than the speakers.
+        for sp in speakers:
+            if sink_has_volume(sp["sink"]):
+                run(["pactl", "set-sink-volume", sp["sink"], "%d%%" % args.volume])
+        for card in original_masters:
+            alsa_master(card, args.volume)
+        if original_masters and not args.json:
+            print("Levelling cards %s through their ALSA mixer (no PipeWire volume)."
+                  % ", ".join(str(c) for c in sorted(original_masters)))
+        with CalibrationGraph(speakers):
+            rec = record_and_play(wav, mic, duration, 100)
+        results = analyse(rec, speakers, emissions)
+    finally:
+        run(["pactl", "set-source-volume", mic["name"], "%d%%" % original_mic_volume])
+        for card, prev in original_masters.items():
+            alsa_master(card, prev)
+        for sink, vol in original_sink_volumes.items():
+            run(["pactl", "set-sink-volume", sink, vol])
+        if was_running:
+            run([os.path.join(HERE, "jspeaker-graph"), "apply"])
+
+    by_key = {r.get("key"): r for r in results if r.get("key")}
+    for sp in profile["speakers"]:
+        if sp["key"] not in by_key:
+            continue
+        sp["measured"] = by_key[sp["key"]]
+        # An output that measures silent again and again is not a speaker with
+        # a level problem, it is a socket with nothing behind it -- a monitor
+        # that advertises audio over EDID but has no drivers, for instance.
+        # Counting it lets the panel say so instead of offering it forever.
+        if by_key[sp["key"]].get("heard"):
+            sp["silentRuns"] = 0
+        else:
+            sp["silentRuns"] = int(sp.get("silentRuns") or 0) + 1
+    profile["calibration"] = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "mic": mic["description"],
+        "volume": args.volume,
+        "results": results,
+    }
+    save_profile(profile)
+
+    if args.json:
+        json.dump(profile["calibration"], sys.stdout, indent=2)
+        print()
+        return
+
+    print("%-28s %10s %10s %9s %s" % ("SPEAKER", "ARRIVES", "LEVEL", "SUGGEST", "CONFIDENCE"))
+    for r in results:
+        if not r.get("heard"):
+            print("%-28s %10s   not heard  (%s)" % (
+                r["label"][:28], "--", r.get("reason", "too quiet or muted")))
+            continue
+        band = r.get("suggestedBand")
+        note = ""
+        if band == "tweeter":
+            note = "  -> tweeter above %.0f Hz (%.0f dB less low end)" % (
+                r.get("suggestedCrossoverHz") or 0, r.get("weakness") or 0)
+        elif band == "primary":
+            note = "  -> primary (carries the bass)"
+        print("%-28s %8.1fms %8.1fdB %7.1fms %8.0fx%s" % (
+            r["label"][:28], r["relativeMs"], r["levelDb"],
+            r["suggestedDelayMs"], r["confidence"], note))
+    print("\nSaved to the profile. Apply with: jspeaker tune  (or jspeaker apply --measured)")
+
+
+if __name__ == "__main__":
+    main()

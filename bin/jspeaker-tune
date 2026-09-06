@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Turn measurements plus a description of the room into a tuning profile.
+
+The measurement says *what is true* -- this speaker arrives 233 ms late, that
+one is 27 dB louder. Deciding what to do about it needs judgement the numbers
+alone do not contain: which speaker is on your left, whether the tinny one
+should carry the highs, whether a speaker behind you should be in the stereo
+image at all. That is what the model is asked for, and only that.
+
+The model's answer is never trusted as-is. Every field is validated and clamped
+against the same rules the profile editor enforces, so a bad reply degrades to
+a rejected suggestion rather than to 2 seconds of delay or a blown driver. If
+no agent is available the deterministic fallback (align to the latest speaker,
+trim to the quietest) still produces a working profile.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "omarchy", "jetti-speaker",
+)
+PROFILE = os.path.join(CONFIG, "profile.json")
+
+ROLES = ("stereo", "left", "right", "mono")
+GAIN_MIN, GAIN_MAX = 0.25, 1.0
+DELAY_MAX = 2000.0
+
+SYSTEM = """You are tuning a multi-speaker playback group on Linux (PipeWire).
+Several physically different speakers play the same audio simultaneously.
+
+You are given, per speaker: its type, how late its sound arrived at a
+microphone relative to the others, how loud it arrived, and octave-band levels
+describing its tonal character. You are also given the user's description of
+where the speakers physically are.
+
+Decide for each speaker:
+  channel  one of "stereo" (both channels), "left", "right", "mono".
+           Use left/right ONLY when the user's description places speakers to
+           one side. A speaker assigned left/right reproduces that channel on
+           all of its drivers. If you assign "left" to any speaker you MUST
+           assign "right" to another, and vice versa -- a one-sided split
+           would drop the other channel entirely and will be rejected. If you
+           cannot pair them, use "stereo" for both.
+  gain     0.25 to 1.0. Trim loud speakers toward the quietest. Never boost.
+  delayMs  0 to 2000. Delay each speaker so all arrive together. The latest
+           speaker gets 0 and every other speaker waits for it. Base this on
+           the measured arrival times, adjusting for the described geometry
+           (sound travels about 2.9 ms per metre).
+  notes    one short sentence explaining the choice for this speaker.
+
+Reply with RAW JSON ONLY, no markdown fence, in exactly this shape:
+{"summary": "<2-3 sentences>", "speakers": [{"key": "<key>", "channel": "...",
+ "gain": 0.0, "delayMs": 0.0, "notes": "..."}]}
+Include every speaker key you were given, and no others."""
+
+
+def die(msg):
+    print("jspeaker-tune: %s" % msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def load():
+    if not os.path.exists(PROFILE):
+        die("no profile yet -- run 'jspeaker profile init'")
+    with open(PROFILE) as fh:
+        return json.load(fh)
+
+
+def save(profile):
+    profile["updatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    fd, tmp = tempfile.mkstemp(dir=CONFIG, prefix=".profile.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(profile, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, PROFILE)
+
+
+def agent_command():
+    """Prefer whatever Omarchy already considers the user's agent."""
+    try:
+        default = subprocess.run(["omarchy-default-agent"], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+    except Exception:
+        default = ""
+    for name in (default, "claude"):
+        if name and shutil.which(name):
+            # Only headless, single-shot invocations; this must never open a UI.
+            if name == "claude":
+                return [name, "-p"]
+            if name in ("codex", "opencode", "crush", "gemini", "pi"):
+                return None  # no stable non-interactive JSON contract; skip
+    return None
+
+
+def build_payload(profile, description):
+    speakers = []
+    for sp in profile.get("speakers", []):
+        if not sp.get("enabled") or not sp.get("sink"):
+            continue
+        m = sp.get("measured") or {}
+        entry = {
+            "key": sp["key"],
+            "label": sp.get("label"),
+            "type": sp.get("kind"),
+            "heard": bool(m.get("heard")),
+        }
+        if m.get("heard"):
+            entry["measuredArrivalMs"] = m.get("relativeMs")
+            entry["measuredLevelDb"] = m.get("levelDb")
+            entry["octaveBandsDb"] = m.get("bands") or {}
+        else:
+            # Omit the metrics entirely rather than sending nulls, and say what
+            # that means, so the model does not treat a missing arrival as 0 ms.
+            entry["note"] = ("This speaker was NOT heard during measurement. "
+                             "Set its delayMs to 0 and leave it at unity gain; "
+                             "any delay for it would be guesswork.")
+        speakers.append(entry)
+    return {"speakers": speakers, "roomDescription": description or "(not provided)"}
+
+
+def call_agent(payload):
+    cmd = agent_command()
+    if not cmd:
+        return None, "no non-interactive agent available"
+    prompt = "%s\n\nHere is the measurement data:\n%s" % (
+        SYSTEM, json.dumps(payload, indent=2))
+    try:
+        out = subprocess.run(cmd + [prompt], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return None, "agent timed out after 180s"
+    except OSError as exc:
+        return None, "could not run agent: %s" % exc
+    if out.returncode != 0:
+        return None, "agent exited %d: %s" % (out.returncode, out.stderr.strip()[:300])
+
+    text = out.stdout.strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None, "agent did not return JSON"
+    try:
+        return json.loads(text[start:end + 1]), None
+    except json.JSONDecodeError as exc:
+        return None, "agent returned malformed JSON: %s" % exc
+
+
+def clamp(value, low, high, default):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return max(low, min(high, v))
+
+
+def apply_suggestion(profile, suggestion, source):
+    """Merge a suggestion into the profile, validating every field."""
+    by_key = {s["key"]: s for s in profile.get("speakers", [])}
+    rejected = []
+    applied = 0
+
+    for entry in suggestion.get("speakers", []):
+        if not isinstance(entry, dict):
+            continue
+        sp = by_key.get(entry.get("key"))
+        if sp is None:
+            rejected.append("unknown speaker key %r" % entry.get("key"))
+            continue
+        role = entry.get("channel")
+        if role not in ROLES:
+            rejected.append("%s: bad channel %r" % (sp["label"], role))
+            role = sp.get("channel", "stereo")
+        sp["channel"] = role
+        sp["gain"] = round(clamp(entry.get("gain"), GAIN_MIN, GAIN_MAX, sp.get("gain", 1.0)), 3)
+
+        # A delay is only meaningful relative to a measured arrival. Without
+        # one there is nothing to align to, and any number here is invented --
+        # so it is refused rather than clamped into a legal-looking value.
+        heard = bool((sp.get("measured") or {}).get("heard"))
+        proposed = clamp(entry.get("delayMs"), 0.0, DELAY_MAX, sp.get("delayMs", 0.0))
+        if heard:
+            sp["delayMs"] = round(proposed, 2)
+        else:
+            if proposed > 1.0:
+                rejected.append(
+                    "%s: refused a %.0f ms delay -- this speaker was never heard, "
+                    "so there is no arrival time to align it to"
+                    % (sp["label"], proposed))
+            sp["delayMs"] = 0.0
+        note = entry.get("notes")
+        sp["notes"] = str(note)[:300] if isinstance(note, str) else ""
+        applied += 1
+
+    # A stereo split only makes sense in pairs; one lone "left" would silently
+    # drop the right channel of everything the group plays.
+    roles = [s["channel"] for s in profile["speakers"] if s.get("enabled")]
+    if roles.count("left") and not roles.count("right"):
+        for s in profile["speakers"]:
+            if s.get("enabled") and s["channel"] == "left":
+                s["channel"] = "stereo"
+        rejected.append("dropped a one-sided left/right split")
+    if roles.count("right") and not roles.count("left"):
+        for s in profile["speakers"]:
+            if s.get("enabled") and s["channel"] == "right":
+                s["channel"] = "stereo"
+        rejected.append("dropped a one-sided left/right split")
+
+    profile["ai"] = {
+        "source": source,
+        "summary": str(suggestion.get("summary", ""))[:1000],
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rejected": rejected,
+        "applied": applied,
+    }
+    return applied, rejected
+
+
+def fallback_suggestion(profile):
+    """Deterministic tuning from the measurements alone, with no model."""
+    heard = [s for s in profile.get("speakers", [])
+             if s.get("enabled") and (s.get("measured") or {}).get("heard")]
+    entries = []
+    for sp in profile.get("speakers", []):
+        if not sp.get("enabled"):
+            continue
+        m = sp.get("measured") or {}
+        entries.append({
+            "key": sp["key"],
+            "channel": sp.get("channel", "stereo"),
+            "gain": m.get("suggestedGain", sp.get("gain", 1.0)),
+            "delayMs": m.get("suggestedDelayMs", sp.get("delayMs", 0.0)),
+            "notes": "Aligned from measurement." if m.get("heard") else "Not measured.",
+        })
+    return {
+        "summary": ("Aligned %d measured speakers to the latest arrival and trimmed "
+                    "levels toward the quietest. No model was used." % len(heard)),
+        "speakers": entries,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("description", nargs="*",
+                    help="where your speakers are, in plain English")
+    ap.add_argument("--no-ai", action="store_true",
+                    help="use the deterministic fallback instead of an agent")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    profile = load()
+    enabled = [s for s in profile.get("speakers", []) if s.get("enabled")]
+    if not enabled:
+        die("no enabled speakers to tune")
+    if not any((s.get("measured") or {}).get("heard") for s in enabled):
+        die("nothing measured yet -- run 'jspeaker calibrate' first")
+
+    description = " ".join(args.description).strip()
+
+    if args.no_ai:
+        suggestion, source, err = fallback_suggestion(profile), "measurement", None
+    else:
+        suggestion, err = call_agent(build_payload(profile, description))
+        source = "agent"
+        if suggestion is None:
+            print("jspeaker-tune: %s; falling back to measurement-only tuning." % err,
+                  file=sys.stderr)
+            suggestion, source = fallback_suggestion(profile), "measurement"
+
+    if description:
+        profile["roomDescription"] = description[:2000]
+    applied, rejected = apply_suggestion(profile, suggestion, source)
+    save(profile)
+
+    if args.json:
+        json.dump(profile, sys.stdout, indent=2)
+        print()
+        return
+
+    print(profile["ai"]["summary"] or "(no summary)")
+    print()
+    print("%-28s %-8s %6s %9s  %s" % ("SPEAKER", "CHANNEL", "GAIN", "DELAY", "WHY"))
+    for sp in profile["speakers"]:
+        if not sp.get("enabled"):
+            continue
+        print("%-28s %-8s %6.2f %7.1fms  %s" % (
+            sp["label"][:28], sp["channel"], sp["gain"], sp["delayMs"],
+            (sp.get("notes") or "")[:44]))
+    for r in rejected:
+        print("\n  rejected: %s" % r, file=sys.stderr)
+    print("\nApply it with: jspeaker apply")
+
+
+if __name__ == "__main__":
+    main()

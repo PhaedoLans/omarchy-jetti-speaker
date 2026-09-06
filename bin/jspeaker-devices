@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Inventory every speaker Jetti Speaker could drive.
+
+Reports two classes of speaker:
+
+  live    a PipeWire sink exists right now and can be added to a group.
+  locked  the hardware is present and the port is available, but the card's
+          active profile does not expose it. Unlocking means switching the
+          card profile, which may cost another output on the same card --
+          so every locked speaker carries what that switch would sacrifice.
+
+Everything is derived from `pactl -f json`, never from parsing human-readable
+output, so descriptions containing colons or newlines cannot desync the parse.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+# Sinks that are part of the plumbing rather than something to play through.
+# "jsxo_" matters as much as the group sink itself: a crossover is exposed as a
+# real Audio/Sink so a loopback can feed it, and without this it gets detected
+# as a speaker, added to the profile, and given its own loopback -- which feeds
+# the crossover a second copy of everything and doubles that speaker.
+VIRTUAL_HINTS = ("jetti_speaker", "jetti_speaker_cal", "jsxo_",
+                 "easyeffects", "auto_null")
+
+
+def pactl(*args):
+    try:
+        out = subprocess.run(
+            ["pactl", "-f", "json", "list", *args],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    try:
+        return json.loads(out or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def alsa_pcm_map():
+    """Map (card, device) -> what is actually plugged into that PCM.
+
+    Needed because a card in `pro-audio` exposes raw PCMs -- pro-output-0,
+    pro-output-3 -- with no port and one shared description, so every output
+    on the card looks identical. ALSA still knows: `aplay -l` prints
+    "device 3: HDMI 0 [LC49G95T]", where the bracketed name is the connected
+    display's own name. When that name differs from the generic PCM name, a
+    display is really there; when it matches, the socket is empty and the
+    output is not worth offering.
+    """
+    out = {}
+    try:
+        listing = subprocess.run(["aplay", "-l"], capture_output=True,
+                                 text=True, timeout=5).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return out
+    for line in listing.splitlines():
+        m = re.match(r"card (\d+):.*?, device (\d+): (.+?) \[(.*?)\]\s*$", line)
+        if not m:
+            continue
+        card, device, pcm_name, pretty = m.groups()
+        out[(int(card), int(device))] = {
+            "pcm": pcm_name.strip(),
+            "pretty": pretty.strip(),
+            "connected": pretty.strip() != pcm_name.strip(),
+        }
+    return out
+
+
+def port_is_output(port):
+    """pactl does not label port direction, so infer it.
+
+    Output ports are the ones a profile counts toward `sinks`; the reliable
+    signal available here is the port type plus the name convention ALSA uses.
+    """
+    if port.get("type") in ("Speaker", "Headphones", "HDMI", "Line"):
+        return True
+    name = port.get("_name", "")
+    return "-output" in name or name.startswith("hdmi-output")
+
+
+def classify(sink_props, port, card_props):
+    bus = (sink_props.get("device.bus") or card_props.get("device.bus") or "").lower()
+    form = (sink_props.get("device.form_factor") or "").lower()
+    api = (sink_props.get("device.api") or card_props.get("device.api") or "").lower()
+    ptype = (port or {}).get("type", "")
+
+    if api == "bluez5" or bus == "bluetooth":
+        return "bluetooth"
+    if ptype == "HDMI":
+        return "hdmi"
+    if form in ("headset", "headphone"):
+        return "usb-headset" if bus == "usb" else "headset"
+    if bus == "usb":
+        return "usb"
+    if form == "internal" or ptype == "Speaker":
+        return "internal"
+    if ptype == "Headphones":
+        return "headphones"
+    return "other"
+
+
+def label_for(kind, description, port, card_props):
+    """A name that means something to a person looking at a list of speakers."""
+    product = (port or {}).get("properties", {}).get("device.product.name")
+    if kind == "hdmi" and product:
+        return "%s (screen)" % product
+    if kind == "hdmi":
+        return "%s (screen)" % ((port or {}).get("description") or description)
+    if kind == "internal":
+        # The port description ("Speakers") is what a person recognises; the
+        # card name ("HDA Intel PCH") is what a kernel developer recognises.
+        return "%s (built-in)" % ((port or {}).get("description") or description)
+    return description
+
+
+def main():
+    cards = pactl("cards")
+    sinks = pactl("sinks")
+    sources = pactl("sources")
+
+    # Every hardware sink names its owning card in `device.name`; virtual
+    # sinks (EasyEffects and our own) simply have none, which is how they get
+    # skipped below rather than by guessing from their names alone.
+    for s_ in sinks:
+        s_["_card_name"] = (s_.get("properties") or {}).get("device.name")
+
+    pcm_map = alsa_pcm_map()
+
+    speakers = []
+    warnings = []
+    seen_sinks = set()
+
+    # ---- live speakers -------------------------------------------------
+    for s in sinks:
+        name = s.get("name") or ""
+        props = s.get("properties") or {}
+        if any(h in name for h in VIRTUAL_HINTS):
+            if "easyeffects" in name:
+                warnings.append({
+                    "id": "easyeffects",
+                    "message": (
+                        "EasyEffects is running. Jetti Speaker links its outputs "
+                        "directly, so EasyEffects cannot capture them -- point its "
+                        "output device at Jetti Speaker and its processing applies to "
+                        "the whole group. If it is aimed at a device that no longer "
+                        "exists it will play to nothing; restart it to re-resolve."
+                    ),
+                })
+            continue
+        if props.get("media.class") not in (None, "Audio/Sink"):
+            continue
+
+        card_name = s.get("_card_name")
+        card = next((c for c in cards if c.get("name") == card_name), {}) or {}
+        cprops = card.get("properties") or {}
+        ports = card.get("ports") or {}
+        active_port = s.get("active_port")
+        port = dict(ports.get(active_port) or {})
+        if port:
+            port["_name"] = active_port
+
+        kind = classify(props, port, cprops)
+        description = props.get("device.description") or s.get("description") or name
+        chan_map = s.get("channel_map") or "front-left,front-right"
+
+        # A raw PCM sink (pro-audio) has no port, so fall back to what ALSA
+        # knows about that device -- including whether anything is plugged in.
+        label = None
+        alsa_path = props.get("api.alsa.path") or ""
+        m = re.match(r"hw:(\d+),(\d+)$", alsa_path)
+        if m and not active_port:
+            entry = pcm_map.get((int(m.group(1)), int(m.group(2))))
+            if entry:
+                if entry["pcm"].startswith("HDMI"):
+                    if not entry["connected"]:
+                        # An HDMI output with no display attached is not a
+                        # speaker; listing it would be four dead entries.
+                        continue
+                    kind = "hdmi"
+                    label = "%s (screen)" % entry["pretty"]
+                else:
+                    kind = "internal"
+                    label = "Speakers (built-in)"
+
+        seen_sinks.add(name)
+        speakers.append({
+            "key": name,
+            "sink": name,
+            "label": label or label_for(kind, description, port, cprops),
+            "description": description,
+            "kind": kind,
+            "state": "live",
+            "card": card_name,
+            "port": active_port,
+            "channels": len([c for c in chan_map.split(",") if c]),
+            "channelMap": chan_map,
+            "muted": bool(s.get("mute")),
+            "runtimeState": s.get("state"),
+            "unlock": None,
+            "sacrifices": [],
+        })
+
+    # ---- locked speakers ----------------------------------------------
+    for card in cards:
+        card_name = card.get("name")
+        cprops = card.get("properties") or {}
+        profiles = card.get("profiles") or {}
+        active = card.get("active_profile")
+        ports = card.get("ports") or {}
+
+        active_out_ports = [
+            pn for pn, p in ports.items()
+            if dict(p, _name=pn) and port_is_output(dict(p, _name=pn))
+            and (active in (p.get("profiles") or []) or active == "pro-audio")
+        ]
+
+        pro = profiles.get("pro-audio") or {}
+        pro_available = bool(pro.get("available")) and active != "pro-audio"
+
+        for pname, p in ports.items():
+            port = dict(p, _name=pname)
+            if not port_is_output(port):
+                continue
+            if port.get("availability") == "not available":
+                continue
+            reachable = active in (port.get("profiles") or []) or active == "pro-audio"
+            if reachable:
+                continue
+
+            # Which profiles could expose this port, cheapest first? A profile
+            # that keeps the card's current outputs alive beats one that does not.
+            options = []
+            for cand in port.get("profiles") or []:
+                cp = profiles.get(cand) or {}
+                if not cp.get("available"):
+                    continue
+                kept = [
+                    op for op in active_out_ports
+                    if cand in ((ports.get(op) or {}).get("profiles") or [])
+                ]
+                lost = [op for op in active_out_ports if op not in kept]
+                options.append({
+                    "profile": cand,
+                    "description": cp.get("description") or cand,
+                    "mode": "exclusive",
+                    "sacrifices": [
+                        (ports.get(op) or {}).get("description") or op for op in lost
+                    ],
+                })
+            options.sort(key=lambda o: len(o["sacrifices"]))
+
+            if pro_available:
+                options.insert(0, {
+                    "profile": "pro-audio",
+                    "description": pro.get("description") or "Pro Audio",
+                    "mode": "pro-audio",
+                    "sacrifices": [],
+                    "note": (
+                        "Exposes every output on this card at once -- the only way to "
+                        "use them together. Costs automatic jack detection and hardware "
+                        "volume on this card, and renames its microphone. WARNING: on "
+                        "some codecs (e.g. Intel ALC256) pro-audio exposes outputs that "
+                        "produce no sound at all. Run Calibrate straight after "
+                        "unlocking; if the new speaker is 'not heard', press Restore "
+                        "card profiles."
+                    ),
+                })
+
+            if not options:
+                continue
+
+            kind = classify({}, port, cprops)
+            if kind == "bluetooth" and any(
+                sp["card"] == card_name and sp["state"] == "live" for sp in speakers
+            ):
+                continue
+            description = port.get("description") or pname
+            speakers.append({
+                "key": "%s::%s" % (card_name, pname),
+                "sink": None,
+                "label": label_for(kind, description, port, cprops),
+                "description": description,
+                "kind": kind,
+                "state": "locked",
+                "card": card_name,
+                "port": pname,
+                "channels": int((port.get("properties") or {}).get("audio.channels.detected") or 2),
+                "channelMap": "front-left,front-right",
+                "muted": False,
+                "runtimeState": None,
+                "unlock": options[0],
+                "unlockOptions": options,
+                "sacrifices": options[0]["sacrifices"],
+            })
+
+    # ---- microphones (for calibration) ---------------------------------
+    mics = []
+    for s in sources:
+        name = s.get("name") or ""
+        props = s.get("properties") or {}
+        if name.endswith(".monitor") or props.get("media.class") == "Audio/Sink":
+            continue
+        if any(h in name for h in VIRTUAL_HINTS):
+            continue
+        mics.append({
+            "name": name,
+            "description": props.get("device.description") or name,
+            "channels": len((s.get("channel_map") or "mono").split(",")),
+            "bus": (props.get("device.bus") or "").lower(),
+            # A speaker's own headset mic hears that speaker far too well to be a
+            # fair judge of a room, and a Bluetooth mic forces the headset into
+            # a low-rate duplex mode that mangles the sweep.
+            "suitable": (props.get("device.bus") or "").lower() not in ("bluetooth",),
+        })
+    mics.sort(key=lambda m: (not m["suitable"], m["bus"] != "pci", m["description"]))
+
+    speakers.sort(key=lambda s: (s["state"] != "live", s["kind"], s["label"]))
+
+    out = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "speakers": speakers,
+        "mics": mics,
+        "defaultSink": subprocess.run(
+            ["pactl", "get-default-sink"], capture_output=True, text=True
+        ).stdout.strip(),
+        "warnings": list({w["id"]: w for w in warnings}.values()),
+    }
+    json.dump(out, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()
